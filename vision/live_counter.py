@@ -16,8 +16,17 @@ from collections import deque
 from vision.biomechanics import BiomechanicsCalculator
 from vision.video_annotator import VideoAnnotator
 
-# Landmark indices
-_mp_pose = mp.solutions.pose
+# Landmark indices — mediapipe 0.10.x keeps solutions under mp.solutions
+try:
+    _mp_pose = mp.solutions.pose
+except AttributeError:
+    # Fallback for environments where solutions is not directly available
+    from mediapipe.python.solutions import pose as _mp_pose_mod
+    import types
+    _mp_pose = types.SimpleNamespace(
+        Pose=_mp_pose_mod.Pose,
+        PoseLandmark=_mp_pose_mod.PoseLandmark,
+    )
 
 class LiveRepCounter:
     """Thread-safe, stateful real-time rep counter."""

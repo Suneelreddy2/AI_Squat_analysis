@@ -1,4 +1,5 @@
 import os
+import subprocess
 import cv2
 import numpy as np
 from typing import Dict, Any, List, Optional, Callable
@@ -135,24 +136,33 @@ class SquatVideoProcessor:
         if progress_callback:
             progress_callback(0.70, "Rendering annotated video with biomechanical overlays...")
 
-        # Annotate video frames and write to MP4 file
-        annotator = VideoAnnotator()
+        # ── Write annotated video ──────────────────────────────────────────────
+        # Strategy 1: try avc1 (H.264 via OpenCV built-in) — directly browser-playable
+        # Strategy 2: fall back to mp4v and re-mux with ffmpeg if available
         annotated_filename = f"annotated_{os.path.basename(video_path)}"
         if not annotated_filename.endswith(".mp4"):
             annotated_filename = os.path.splitext(annotated_filename)[0] + ".mp4"
         annotated_path = os.path.join(output_dir, annotated_filename)
 
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out_writer = cv2.VideoWriter(annotated_path, fourcc, fps, (width, height))
+        # Try H.264 (avc1) directly with OpenCV
+        used_avc1 = False
+        fourcc_avc1 = cv2.VideoWriter_fourcc(*'avc1')
+        out_writer = cv2.VideoWriter(annotated_path, fourcc_avc1, fps, (width, height))
+        if out_writer.isOpened():
+            used_avc1 = True
+        else:
+            out_writer.release()
+            fourcc_mp4v = cv2.VideoWriter_fourcc(*'mp4v')
+            out_writer = cv2.VideoWriter(annotated_path, fourcc_mp4v, fps, (width, height))
+
+        annotator = VideoAnnotator()
 
         for idx, frame in enumerate(raw_frames):
             lm = landmarks_history[idx]
             tel = frames_telemetry[idx]
-            
-            # Determine current rep & phase
+
             cur_rep = None
             cur_phase = "SETUP / STANDING"
-
             for rep in evaluated_reps:
                 if rep["start_frame"] <= idx <= rep["end_frame"]:
                     cur_rep = rep
@@ -176,11 +186,31 @@ class SquatVideoProcessor:
 
         out_writer.release()
 
-        # Convert video to H.264 mp4 using ffmpeg if available for browser compatibility
-        web_compatible_path = os.path.join(output_dir, f"web_{annotated_filename}")
-        ffmpeg_cmd = f"ffmpeg -y -i '{annotated_path}' -vcodec libx264 -pix_fmt yuv420p '{web_compatible_path}' >/dev/null 2>&1"
-        res = os.system(ffmpeg_cmd)
-        final_video_path = web_compatible_path if res == 0 and os.path.exists(web_compatible_path) else annotated_path
+        final_video_path = annotated_path
+
+        # If we used mp4v, try to re-encode to H.264 with system ffmpeg
+        if not used_avc1:
+            web_path = os.path.join(output_dir, f"web_{annotated_filename}")
+            for ffmpeg_cmd in ["ffmpeg", "ffmpeg.exe"]:
+                try:
+                    cmd = [
+                        ffmpeg_cmd, "-y",
+                        "-i", annotated_path,
+                        "-vcodec", "libx264",
+                        "-pix_fmt", "yuv420p",
+                        "-movflags", "+faststart",
+                        web_path
+                    ]
+                    res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
+                    if res.returncode == 0 and os.path.exists(web_path) and os.path.getsize(web_path) > 0:
+                        final_video_path = web_path
+                        try:
+                            os.remove(annotated_path)
+                        except Exception:
+                            pass
+                        break
+                except Exception:
+                    continue
 
         if progress_callback:
             progress_callback(1.0, "Analysis complete!")

@@ -1,3 +1,4 @@
+
 import time
 from vision.processor import SquatVideoProcessor
 

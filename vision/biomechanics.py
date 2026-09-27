@@ -34,9 +34,10 @@ class BiomechanicsCalculator:
         Negative values indicates looking downward at floor.
         Positive values indicates looking upward at ceiling.
         """
-        # Head vector from ear to eye/nose
+        # Head vector from ear to eye/nose. In image space, Y increases downwards.
+        # When looking down, eye is lower than ear (eye[1] > ear[1]), so ear[1] - eye[1] is negative.
         ref_x = eye[0] - ear[0]
-        ref_y = eye[1] - ear[1]
+        ref_y = ear[1] - eye[1]
         angle = math.degrees(math.atan2(ref_y, abs(ref_x) + 1e-6))
         return angle
 
@@ -82,7 +83,12 @@ class BiomechanicsCalculator:
         is_deep = depth_delta_px > 0
 
         # 4. Knee forward travel relative to toe
-        knee_forward_px = max(0.0, (knee[0] - toe[0]) if toe[0] > heel[0] else (heel[0] - knee[0]))
+        # If facing right (toe_x > heel_x): knee is in front of toe if knee_x > toe_x
+        # If facing left (toe_x < heel_x): knee is in front of toe if knee_x < toe_x
+        if toe[0] > heel[0]:
+            knee_forward_px = max(0.0, knee[0] - toe[0])
+        else:
+            knee_forward_px = max(0.0, toe[0] - knee[0])
 
         return {
             "valid": True,

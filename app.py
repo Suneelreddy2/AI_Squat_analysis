@@ -1,14 +1,20 @@
 import os
 import sys
-import base64
 import tempfile
 import time
+import subprocess
 import streamlit as st
-import streamlit.components.v1 as components
 import pandas as pd
 import numpy as np
-import av
-from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
+try:
+    import av
+    from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
+    HAS_WEBRTC = True
+except ImportError:
+    HAS_WEBRTC = False
+    webrtc_streamer = None
+    VideoProcessorBase = object
+    RTCConfiguration = None
 
 # Ensure local imports work
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -17,194 +23,90 @@ from vision.processor import SquatVideoProcessor
 from squat_skill.skill_engine import SquatSkillEngine
 from vision.live_counter import LiveRepCounter
 
-# ── Page Config ──────────────────────────────────────────────────────────────
+# ── Page Configuration ────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="AI Barbell Squat Analysis",
+    page_title="AI Barbell Squat Analysis & Biomechanics Studio",
     page_icon="🏋️",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed"
 )
 
-# ── Global Dark Styles ────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&family=Inter:wght@400;500;600&display=swap');
-html, body, [data-testid="stAppViewContainer"], .main { background: #080d1a !important; }
-* { font-family: 'Inter', sans-serif; }
-h1,h2,h3,h4,h5 { font-family: 'Outfit', sans-serif !important; }
-
-[data-testid="stMetric"] {
-    background: rgba(20,30,50,0.7);
-    border: 1px solid rgba(255,255,255,0.07);
-    border-radius: 12px;
-    padding: 16px 20px;
-    backdrop-filter: blur(10px);
-}
-.card {
-    background: rgba(15, 22, 40, 0.75);
-    backdrop-filter: blur(14px);
-    border: 1px solid rgba(255,255,255,0.07);
-    border-radius: 14px;
-    padding: 18px 22px;
-    margin-bottom: 14px;
-    box-shadow: 0 8px 32px rgba(0,0,0,0.45);
-}
-.status-badge-pass   { background:rgba(16,185,129,0.15); color:#10b981; border:1px solid rgba(16,185,129,0.35); border-radius:20px; padding:4px 14px; font-weight:600; font-size:.82rem; }
-.status-badge-fail   { background:rgba(239,68,68,0.15);  color:#ef4444; border:1px solid rgba(239,68,68,0.35);  border-radius:20px; padding:4px 14px; font-weight:600; font-size:.82rem; }
-.status-badge-cannot { background:rgba(148,163,184,0.12);color:#94a3b8; border:1px solid rgba(148,163,184,0.3); border-radius:20px; padding:4px 14px; font-weight:600; font-size:.82rem; }
-.citation-pill { background:rgba(99,102,241,0.14); color:#818cf8; border:1px solid rgba(99,102,241,0.3); border-radius:8px; padding:3px 9px; font-size:.74rem; font-weight:500; }
-</style>
-""", unsafe_allow_html=True)
+# ── Inject Custom CSS Design System ───────────────────────────────────────────
+css_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "styles.css")
+if os.path.exists(css_path):
+    with open(css_path, "r", encoding="utf-8") as f:
+        st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def video_b64(path: str) -> str:
-    with open(path, "rb") as f:
-        return base64.b64encode(f.read()).decode()
+# ── WebRTC Live Camera Transformer ───────────────────────────────────────────
+if HAS_WEBRTC:
+    class _SquatTransformer(VideoProcessorBase):
+        """Processes webcam frames server-side: MediaPipe pose + real-time rep counter."""
+        def __init__(self):
+            self.counter = LiveRepCounter()
 
-
-def synced_video_player(original_path: str, annotated_path: str) -> None:
-    """Full-width synchronized dual video player — one play button controls both."""
-    orig_b64 = video_b64(original_path)
-    ann_b64  = video_b64(annotated_path)
-
-    html = f"""
-<!DOCTYPE html><html><head>
-<style>
-* {{ box-sizing:border-box; margin:0; padding:0; }}
-body {{ background:#080d1a; font-family:'Inter',sans-serif; overflow:hidden; }}
-.stage {{ display:flex; flex-direction:column; width:100%; gap:10px; }}
-.labels {{ display:flex; width:100%; gap:8px; }}
-.label {{ flex:1; text-align:center; color:#94a3b8; font-size:.78rem; font-weight:600;
-          letter-spacing:.06em; text-transform:uppercase; padding:4px 0 2px; }}
-.videos {{ display:flex; width:100%; gap:8px; align-items:flex-start; }}
-.vid-wrap {{ flex:1; background:#000; border-radius:10px; overflow:hidden;
-             border:1px solid rgba(255,255,255,0.08); }}
-video {{ width:100%; height:auto; display:block; object-fit:contain; max-height:70vh; }}
-.controls {{ display:flex; align-items:center; gap:14px;
-             background:rgba(15,22,40,0.85); border:1px solid rgba(255,255,255,0.07);
-             border-radius:12px; padding:10px 18px; backdrop-filter:blur(12px); }}
-.btn {{ background:linear-gradient(135deg,#6366f1,#8b5cf6); color:#fff; border:none;
-        border-radius:8px; padding:8px 20px; font-size:.88rem; font-weight:600;
-        cursor:pointer; transition:opacity .15s; white-space:nowrap; }}
-.btn:hover {{ opacity:.85; }}
-.seek {{ flex:1; -webkit-appearance:none; height:5px; border-radius:3px;
-         background:#1e2a40; outline:none; cursor:pointer; accent-color:#6366f1; }}
-.time-lbl {{ color:#64748b; font-size:.78rem; white-space:nowrap; min-width:90px; text-align:right; }}
-.mute-btn {{ background:rgba(99,102,241,0.15); color:#818cf8;
-             border:1px solid rgba(99,102,241,0.3); border-radius:8px;
-             padding:7px 14px; font-size:.8rem; cursor:pointer; }}
-.mute-btn:hover {{ opacity:.8; }}
-</style>
-</head><body>
-<div class="stage">
-  <div class="labels">
-    <div class="label">📹 Original Input</div>
-    <div class="label">🤖 AI Annotated Analysis</div>
-  </div>
-  <div class="videos">
-    <div class="vid-wrap">
-      <video id="v1" preload="auto" playsinline muted>
-        <source src="data:video/mp4;base64,{orig_b64}" type="video/mp4">
-      </video>
-    </div>
-    <div class="vid-wrap">
-      <video id="v2" preload="auto" playsinline muted>
-        <source src="data:video/mp4;base64,{ann_b64}" type="video/mp4">
-      </video>
-    </div>
-  </div>
-  <div class="controls">
-    <button class="btn" id="playBtn" onclick="togglePlay()">▶ Play Both</button>
-    <input  class="seek" type="range" id="seeker" min="0" max="1000" value="0"
-            oninput="onSeek(this.value)">
-    <span   class="time-lbl" id="timeLbl">0.0 / 0.0 s</span>
-    <button class="mute-btn" id="muteBtn" onclick="toggleMute()">🔇 Mute</button>
-  </div>
-</div>
-<script>
-const v1=document.getElementById('v1'),v2=document.getElementById('v2');
-const btn=document.getElementById('playBtn'),seek=document.getElementById('seeker');
-const tLbl=document.getElementById('timeLbl'),mBtn=document.getElementById('muteBtn');
-let muted=true;
-
-function syncTick(){{
-  if(!v1.paused){{
-    const drift=v1.currentTime-v2.currentTime;
-    if(Math.abs(drift)>0.05) v2.currentTime=v1.currentTime;
-    seek.value=Math.round((v1.currentTime/(v1.duration||1))*1000);
-    tLbl.textContent=v1.currentTime.toFixed(1)+' / '+(v1.duration||0).toFixed(1)+' s';
-  }}
-  requestAnimationFrame(syncTick);
-}}
-requestAnimationFrame(syncTick);
-
-function togglePlay(){{
-  if(v1.paused){{v1.play();v2.play();btn.textContent='⏸ Pause';}}
-  else{{v1.pause();v2.pause();btn.textContent='▶ Play Both';}}
-}}
-function onSeek(val){{
-  const t=(val/1000)*(v1.duration||0);
-  v1.currentTime=t; v2.currentTime=t;
-  tLbl.textContent=t.toFixed(1)+' / '+(v1.duration||0).toFixed(1)+' s';
-}}
-function toggleMute(){{
-  muted=!muted; v1.muted=muted; v2.muted=muted;
-  mBtn.textContent=muted?'🔇 Mute':'🔊 Sound';
-}}
-[v1,v2].forEach(v=>v.addEventListener('ended',()=>{{v1.pause();v2.pause();btn.textContent='▶ Play Both';}}));
-document.addEventListener('keydown',e=>{{if(e.code==='Space'){{e.preventDefault();togglePlay();}}}});
-</script>
-</body></html>
-"""
-    components.html(html, height=720, scrolling=False)
-
-
-# ── WebRTC Transformer (defined before any st.* calls) ────────────────────────
-class _SquatTransformer(VideoProcessorBase):
-    """Processes webcam frames server-side: MediaPipe pose + rep counting."""
-    def __init__(self):
-        self.counter = LiveRepCounter()
-
-    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        bgr = frame.to_ndarray(format="bgr24")
-        out = self.counter.process_frame(bgr)
-        return av.VideoFrame.from_ndarray(out, format="bgr24")
+        def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+            bgr = frame.to_ndarray(format="bgr24")
+            out = self.counter.process_frame(bgr)
+            return av.VideoFrame.from_ndarray(out, format="bgr24")
+else:
+    _SquatTransformer = None
 
 
 def _render_live_camera():
-    """Live webcam panel — WebRTC stream + real-time KPI cards."""
+    """Live interactive webcam studio panel."""
     st.markdown("""
-    <h3 style='margin-bottom:4px;background:linear-gradient(135deg,#6366f1,#38bdf8);
-               -webkit-background-clip:text;-webkit-text-fill-color:transparent;'>
-      📷 Live Rep Counter — Laptop Camera
-    </h3>
-    <p style='color:#64748b;font-size:.88rem;margin-top:0;'>
-      Stand <strong>sideways</strong> to your camera (left or right side facing it).
-      MediaPipe tracks your body frame-by-frame and counts reps in real time.
-    </p>
+    <div class="card" style="margin-bottom:18px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
+        <div>
+          <h3 style="margin:0;color:#ffffff;font-size:1.35rem;">
+            📷 Real-Time Biomechanics & Rep Counter
+          </h3>
+          <p style="color:#cbd5e1;font-size:0.9rem;margin:4px 0 0;">
+            Stand <strong>sideways (profile view)</strong> 6–8 feet from camera. Tracks full-body kinematics & counts reps live.
+          </p>
+        </div>
+        <div style="display:flex;gap:8px;">
+          <span class="status-badge status-badge-pass">● WebRTC Active</span>
+          <span class="citation-pill">MediaPipe Pose v0.10</span>
+        </div>
+      </div>
+    </div>
     """, unsafe_allow_html=True)
 
-    st.info(
-        "**Tip:** Ensure your full body (head → feet) is visible sideways in frame. "
-        "Reps increment when your hips rise back to standing height after each squat descent."
-    )
+    c_stream, c_setup = st.columns([3, 1])
 
-    RTC_CONFIG = RTCConfiguration(
-        {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
-    )
+    with c_setup:
+        st.markdown("""
+        <div class="card" style="padding:18px;">
+          <h4 style="font-size:1.0rem;margin-bottom:10px;color:#38bdf8;">🎯 Setup Guide</h4>
+          <ul style="font-size:0.88rem;color:#cbd5e1;padding-left:18px;line-height:1.7;">
+            <li>Position camera at <strong>hip height</strong></li>
+            <li>Stand in <strong>side profile view</strong> (facing 90° from camera)</li>
+            <li>Ensure full body is visible (head to heels)</li>
+            <li>Reps increment upon rising to full standing extension</li>
+          </ul>
+        </div>
+        """, unsafe_allow_html=True)
 
-    ctx = webrtc_streamer(
-        key="squat-live",
-        video_processor_factory=_SquatTransformer,
-        rtc_configuration=RTC_CONFIG,
-        media_stream_constraints={"video": True, "audio": False},
-        async_processing=True,
-    )
+    if not HAS_WEBRTC:
+        st.warning("⚠️ `streamlit-webrtc` and `av` packages are required for real-time webcam processing. Run `pip install streamlit-webrtc av` to enable live camera analysis.")
+        return
 
-    st.divider()
-    st.caption("📊 Live Biomechanics — updates every 0.5 s while camera is active")
+    with c_stream:
+        RTC_CONFIG = RTCConfiguration(
+            {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+        )
 
+        ctx = webrtc_streamer(
+            key="squat-live",
+            video_processor_factory=_SquatTransformer,
+            rtc_configuration=RTC_CONFIG,
+            media_stream_constraints={"video": True, "audio": False},
+            async_processing=True,
+        )
+
+    st.markdown("<h4 style='color:#ffffff;margin-top:16px;'>📊 Live Kinematic Telemetry</h4>", unsafe_allow_html=True)
     k1, k2, k3, k4, k5 = st.columns(5)
     slot_reps  = k1.empty()
     slot_phase = k2.empty()
@@ -212,79 +114,71 @@ def _render_live_camera():
     slot_back  = k4.empty()
     slot_depth = k5.empty()
 
-    # Defaults while not playing
-    slot_reps.metric("🔁 Reps",      "0")
-    slot_phase.metric("🧩 Phase",    "⏸ STANDING")
-    slot_knee.metric("🦵 Knee",      "—")
-    slot_back.metric("📐 Back",      "—")
-    slot_depth.metric("📉 Depth OK", "—")
+    slot_reps.metric("🔁 Total Reps", "0")
+    slot_phase.metric("🧩 Phase", "⏸ STANDING")
+    slot_knee.metric("🦵 Knee Flexion", "—")
+    slot_back.metric("📐 Torso Angle", "—")
+    slot_depth.metric("📉 Depth Crease", "—")
 
-    if st.button("🔄 Reset Counter", key="live_reset_btn"):
-        if ctx.video_processor:
-            ctx.video_processor.counter.reset()
+    r_col1, r_col2 = st.columns([1.5, 4])
+    with r_col1:
+        if st.button("🔄 Reset Live Counter", key="live_reset_btn", use_container_width=True):
+            if ctx and ctx.video_processor:
+                ctx.video_processor.counter.reset()
 
-    if ctx.state.playing:
+    if ctx and ctx.state.playing:
         phase_map = {
-            "BOTTOM":   "🟢 BOTTOM",
+            "BOTTOM":   "🟢 AT BOTTOM",
             "DESCENT":  "🔽 DESCENT",
             "ASCENT":   "🔼 ASCENT",
             "STANDING": "⏸ STANDING",
         }
         while ctx.state.playing:
-            time.sleep(0.5)
+            time.sleep(0.4)
             if not ctx.video_processor:
                 break
             m = ctx.video_processor.counter.get_metrics()
-            slot_reps.metric("🔁 Reps",      str(m['rep_count']))
-            slot_phase.metric("🧩 Phase",     phase_map.get(m['phase'], m['phase']))
-            slot_knee.metric("🦵 Knee",       f"{m['knee_angle']:.0f}°")
-            slot_back.metric("📐 Back",       f"{m['back_angle']:.0f}°")
-            slot_depth.metric("📉 Depth OK",  "✅ Yes" if m['depth_ok'] else "❌ Not yet")
+            slot_reps.metric("🔁 Total Reps", str(m['rep_count']))
+            slot_phase.metric("🧩 Phase", phase_map.get(m['phase'], m['phase']))
+            slot_knee.metric("🦵 Knee Flexion", f"{m['knee_angle']:.0f}°")
+            slot_back.metric("📐 Torso Angle", f"{m['back_angle']:.0f}°")
+            slot_depth.metric("📉 Depth Crease", "✅ PASSED" if m['depth_ok'] else "⏳ NOT YET")
 
 
-# ── Top Navigation & Control Bar ─────────────────────────────────────────────
+# ── Top Navigation Header & Brand Bar ─────────────────────────────────────────
 st.markdown("""
-<style>
-.top-navbar {
-    background: rgba(15, 22, 40, 0.85);
-    backdrop-filter: blur(16px);
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    border-radius: 16px;
-    padding: 16px 24px;
-    margin-bottom: 20px;
-    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
-}
-.brand-title {
-    background: linear-gradient(135deg, #6366f1, #8b5cf6, #38bdf8);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    font-size: 1.6rem;
-    font-weight: 700;
-    margin: 0;
-}
-.brand-sub {
-    color: #64748b;
-    font-size: 0.82rem;
-    margin-top: 2px;
-}
-</style>
+<div style="display:flex;justify-content:space-between;align-items:center;padding:14px 24px;
+            background:linear-gradient(135deg,#0f172a,#1e293b);
+            border:1px solid rgba(255,255,255,0.12);border-radius:16px;margin-bottom:20px;
+            box-shadow:0 8px 32px rgba(0,0,0,0.5);">
+  <div style="display:flex;align-items:center;gap:16px;">
+    <div style="background:linear-gradient(135deg,#6366f1,#8b5cf6);width:46px;height:46px;
+                border-radius:12px;display:flex;align-items:center;justify-content:center;
+                font-size:1.6rem;box-shadow:0 0 20px rgba(99,102,241,0.5);">
+      🏋️
+    </div>
+    <div>
+      <div style="font-family:'Outfit',sans-serif;font-size:1.5rem;font-weight:800;letter-spacing:-0.02em;color:#ffffff;">
+        AESTHETIQ BIOMECHANICS
+      </div>
+      <div style="color:#cbd5e1;font-size:0.84rem;font-weight:500;">
+        Pure Python Computer Vision · MediaPipe Pose v0.10 · Starting Strength Standards
+      </div>
+    </div>
+  </div>
+  <div style="display:flex;align-items:center;gap:12px;">
+    <span class="status-badge status-badge-pass">● Vision Pipeline Online</span>
+    <span class="citation-pill">📖 7 Rules Grounded</span>
+  </div>
+</div>
 """, unsafe_allow_html=True)
 
-# Top Banner Row: Brand Title + Mode Segment Switch
-header_col1, header_col2 = st.columns([2, 1])
-
-with header_col1:
-    st.markdown("""
-    <div>
-      <div class="brand-title">🏋️ AI Barbell Squat Analysis & Skill Evaluator</div>
-      <div class="brand-sub">Pure Python Computer Vision · MediaPipe Pose · Grounded in Starting Strength Standards</div>
-    </div>
-    """, unsafe_allow_html=True)
-
-with header_col2:
+# Mode Selector
+nav_col1, nav_col2 = st.columns([3, 1])
+with nav_col1:
     app_mode = st.radio(
-        "Mode Switch",
-        options=["📂 Video Analysis", "📷 Live Camera Counter"],
+        "Application Mode",
+        options=["📂 Video Analysis Studio", "📷 Live Camera Counter"],
         horizontal=True,
         label_visibility="collapsed",
         key="app_mode_switch"
@@ -293,30 +187,30 @@ with header_col2:
 selected_video_path = None
 run_analysis = False
 
-# Interactive Control Toolbar for Video Analysis mode
-if app_mode == "📂 Video Analysis":
+sample_video_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "samples", "common_sample.mp4")
+
+# Interactive Control Toolbar for Video Mode
+if app_mode == "📂 Video Analysis Studio":
     st.markdown("""
-    <div style='background:rgba(20,30,52,0.6);border:1px solid rgba(255,255,255,0.07);
-                border-radius:14px;padding:14px 20px;margin-bottom:20px;backdrop-filter:blur(10px);'>
+    <div style="background:rgba(18,27,48,0.95);border:1px solid rgba(255,255,255,0.12);
+                border-radius:16px;padding:18px 24px;margin-bottom:20px;">
     """, unsafe_allow_html=True)
 
-    ctrl_col1, ctrl_col2, ctrl_col3 = st.columns([1.2, 2.5, 1.2])
+    ctrl_col1, ctrl_col2, ctrl_col3 = st.columns([1.2, 2.6, 1.2])
 
     with ctrl_col1:
         video_source_type = st.selectbox(
-            "Select Video Source:",
-            options=["🎥 YouTube Video (URL / Sample)", "📤 Upload Side-View Video"],
+            "Video Ingestion Source:",
+            options=["🎥 YouTube Video / Benchmark Sample", "📤 Upload Custom Video (MP4/MOV)"],
             key="video_source_dropdown"
         )
 
-    sample_video_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "samples", "common_sample.mp4")
-
-    if video_source_type == "🎥 YouTube Video (URL / Sample)":
+    if video_source_type == "🎥 YouTube Video / Benchmark Sample":
         with ctrl_col2:
             yt_url = st.text_input(
-                "YouTube Link (Editable):",
+                "YouTube Video Link:",
                 value="https://youtube.com/shorts/TRvg083BrXY",
-                help="Paste any YouTube video or short link here",
+                help="Paste any YouTube squat video or short URL",
                 key="yt_url_input"
             )
         default_url = "https://youtube.com/shorts/TRvg083BrXY"
@@ -329,7 +223,7 @@ if app_mode == "📂 Video Analysis":
                 selected_video_path = st.session_state["custom_yt_path"]
 
         with ctrl_col3:
-            st.write("") # Spacer
+            st.write("")
             if not is_default and selected_video_path is None:
                 if st.button("⬇️ Download Video", use_container_width=True):
                     with st.spinner("Downloading with yt-dlp..."):
@@ -337,20 +231,24 @@ if app_mode == "📂 Video Analysis":
                         custom_path = os.path.join("samples", "custom_yt_input.mp4")
                         if os.path.exists(custom_path):
                             os.remove(custom_path)
-                        res = os.system(f"./venv/bin/yt-dlp -f mp4 -o '{custom_path}' '{yt_url}'")
-                        if res == 0 and os.path.exists(custom_path):
-                            st.session_state["custom_yt_path"] = custom_path
-                            st.success("Downloaded!")
-                            st.rerun()
-                        else:
-                            st.error("Failed to download link.")
+                        try:
+                            cmd = [sys.executable, "-m", "yt_dlp", "-f", "mp4", "-o", custom_path, yt_url]
+                            res = subprocess.run(cmd, capture_output=True, text=True)
+                            if res.returncode == 0 and os.path.exists(custom_path):
+                                st.session_state["custom_yt_path"] = custom_path
+                                st.success("Video downloaded successfully!")
+                                st.rerun()
+                            else:
+                                st.error(f"Failed to download: {res.stderr[:200] if res.stderr else 'Unknown error'}")
+                        except Exception as e:
+                            st.error(f"Download error: {e}")
             else:
                 run_analysis = st.button("🚀 Run AI Assessment", type="primary", use_container_width=True)
 
     else:
         with ctrl_col2:
             uploaded = st.file_uploader(
-                "Upload Side-View Squat Video (MP4/MOV/AVI)",
+                "Upload Side-View Squat Video (MP4 / MOV / AVI)",
                 type=["mp4", "mov", "avi"],
                 key="file_uploader_control"
             )
@@ -360,15 +258,14 @@ if app_mode == "📂 Video Analysis":
                 tfile.close()
                 selected_video_path = tfile.name
         with ctrl_col3:
-            st.write("") # Spacer
+            st.write("")
             run_analysis = st.button("🚀 Run AI Assessment", type="primary", use_container_width=True)
 
     st.markdown("</div>", unsafe_allow_html=True)
-st.divider()
 
 
-# ── Main Content ──────────────────────────────────────────────────────────────
-if selected_video_path:
+# ── Processing & Main Dashboard View ──────────────────────────────────────────
+if selected_video_path and app_mode == "📂 Video Analysis Studio":
     need_run = (
         run_analysis
         or "analysis_result" not in st.session_state
@@ -376,7 +273,7 @@ if selected_video_path:
     )
 
     if run_analysis and need_run:
-        prog = st.progress(0, text="Initialising Vision & Skill Engine…")
+        prog = st.progress(0, text="Initialising Vision & Biomechanics Pipeline…")
         stat = st.empty()
 
         def cb(pct, msg):
@@ -389,160 +286,495 @@ if selected_video_path:
                 selected_video_path, output_dir="output", progress_callback=cb
             )
             st.session_state["analysis_result"] = result
-            st.session_state["active_video"]    = selected_video_path
-            prog.empty(); stat.empty()
-            st.toast("🎉 Analysis complete!", icon="✅")
+            st.session_state["active_video"] = selected_video_path
+            prog.empty()
+            stat.empty()
+            st.toast("🎉 Biomechanical assessment complete!", icon="✅")
         except Exception as exc:
-            prog.empty(); stat.empty()
-            st.error(f"Error: {exc}")
+            prog.empty()
+            stat.empty()
+            st.error(f"Vision Processing Error: {exc}")
 
     result = st.session_state.get("analysis_result")
 
     if result:
         reps = result.get("repetitions", [])
 
-        # ── KPI Row ──────────────────────────────────────────────────────────
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("⏱ Duration",      f"{result['duration_sec']:.1f} s")
-        c2.metric("🔁 Reps Detected", str(len(reps)))
+        # Executive KPI Row
         total_ev = sum(len(r["findings"]) for r in reps)
-        passes   = sum(
+        passes = sum(
             sum(1 for f in r["findings"] if f["status"] == "MEETS_STANDARD")
             for r in reps
         )
-        c3.metric("✅ Pass Rate",  f"{passes / total_ev * 100:.0f}%" if total_ev else "—")
-        c4.metric("🎬 Output",    "H.264 MP4")
-        st.divider()
+        pass_rate = (passes / total_ev * 100) if total_ev > 0 else 0
 
-        # ── Tabs ─────────────────────────────────────────────────────────────
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("⏱ Total Duration", f"{result['duration_sec']:.1f} s")
+        c2.metric("🔁 Detected Reps", f"{len(reps)} Reps")
+        c3.metric("✅ Standards Pass Rate", f"{pass_rate:.0f}%")
+        c4.metric("🎬 Video Output", "H.264 MP4 Synced")
+
+        st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
+
+        # Tab Navigation
         tab1, tab2, tab3, tab4, tab5 = st.tabs([
-            "🎥 Synced Video Player",
+            "🎥 Video Analysis Studio",
             "📋 Rep-by-Rep Audit",
             "📊 Biomechanics Telemetry",
             "📖 Skill Rule Inspector",
             "📷 Live Camera Counter",
         ])
 
-        # TAB 1: Synced Dual Player
+        # ── TAB 1: Clean Dual Video Analysis Studio ───────────────────────────
         with tab1:
             ann_path = result.get("annotated_video_path")
-            if ann_path and os.path.exists(ann_path):
-                synced_video_player(selected_video_path, ann_path)
-            else:
-                col_a, col_b = st.columns(2)
-                with col_a:
-                    st.caption("📹 Original")
-                    st.video(selected_video_path)
-                with col_b:
-                    st.warning("Annotated video not found.")
+            
+            # Action & metadata toolbar
+            t_col1, t_col2 = st.columns([3, 1])
+            with t_col1:
+                st.markdown(f"""
+                <div style="display:flex;gap:12px;align-items:center;margin-bottom:12px;">
+                  <span class="observed-pill">Video: {os.path.basename(selected_video_path)}</span>
+                  <span class="observed-pill">FPS: {result.get('fps', 30.0):.1f}</span>
+                  <span class="observed-pill">Total Frames: {result.get('total_frames', 0)}</span>
+                </div>
+                """, unsafe_allow_html=True)
+            
+            with t_col2:
+                if ann_path and os.path.exists(ann_path):
+                    with open(ann_path, "rb") as vf:
+                        st.download_button(
+                            label="📥 Download Annotated Video",
+                            data=vf.read(),
+                            file_name=f"annotated_{os.path.basename(selected_video_path)}",
+                            mime="video/mp4",
+                            use_container_width=True
+                        )
 
-        # TAB 2: Rep-by-Rep Audit
+            # ── Synchronized dual HTML5 video player ──────────────────────────
+            import base64
+
+            def _video_b64(path: str) -> str:
+                with open(path, "rb") as f:
+                    return base64.b64encode(f.read()).decode()
+
+            raw_b64  = _video_b64(selected_video_path)
+            ann_b64  = _video_b64(ann_path) if ann_path and os.path.exists(ann_path) else None
+
+            dual_player_html = f"""
+<style>
+.dual-player-wrap {{
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+  flex-wrap: wrap;
+}}
+.vid-card {{
+  flex: 1 1 0;
+  min-width: 260px;
+  background: rgba(15,23,42,0.95);
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 14px;
+  overflow: hidden;
+}}
+.vid-card-header {{
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 14px;
+  background: rgba(30,41,59,0.9);
+  border-bottom: 1px solid rgba(255,255,255,0.08);
+  font-family: 'Inter', sans-serif;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: #cbd5e1;
+}}
+.vid-badge-raw  {{ background:rgba(100,116,139,0.3); color:#94a3b8; padding:2px 8px; border-radius:6px; font-size:0.72rem; font-weight:700; }}
+.vid-badge-ai   {{ background:rgba(34,197,94,0.2);  color:#4ade80; padding:2px 8px; border-radius:6px; font-size:0.72rem; font-weight:700; }}
+.vid-card video {{
+  width: 100%;
+  max-height: 340px;
+  object-fit: contain;
+  display: block;
+  background: #000;
+}}
+.sync-toolbar {{
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 0 4px 0;
+  flex-wrap: wrap;
+}}
+.sync-btn {{
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 18px;
+  border-radius: 8px;
+  border: none;
+  font-family: 'Inter', sans-serif;
+  font-size: 0.84rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.18s;
+}}
+.sync-btn-play  {{ background: linear-gradient(135deg,#6366f1,#8b5cf6); color:#fff; }}
+.sync-btn-pause {{ background: rgba(51,65,85,0.9); color:#cbd5e1; border:1px solid rgba(255,255,255,0.15); }}
+.sync-btn-reset {{ background: rgba(51,65,85,0.9); color:#cbd5e1; border:1px solid rgba(255,255,255,0.15); }}
+.sync-btn:hover  {{ transform: translateY(-1px); filter: brightness(1.1); }}
+.sync-status {{
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.78rem;
+  color: #64748b;
+  margin-left: auto;
+}}
+</style>
+
+<div class="sync-toolbar">
+  <button class="sync-btn sync-btn-play"  onclick="playBoth()">▶ Play Both</button>
+  <button class="sync-btn sync-btn-pause" onclick="pauseBoth()">⏸ Pause Both</button>
+  <button class="sync-btn sync-btn-reset" onclick="resetBoth()">⟳ Reset</button>
+  <span class="sync-status" id="syncStatus">Ready — click ▶ Play Both to start</span>
+</div>
+
+<div class="dual-player-wrap">
+  <div class="vid-card">
+    <div class="vid-card-header">
+      📹 Camera 01 · Original Input Footage
+      <span class="vid-badge-raw">RAW INPUT</span>
+    </div>
+    <video id="vidRaw" preload="auto" controls>
+      <source src="data:video/mp4;base64,{raw_b64}" type="video/mp4">
+    </video>
+  </div>
+  <div class="vid-card">
+    <div class="vid-card-header">
+      🤖 Camera 02 · AI Annotated Biomechanics
+      <span class="vid-badge-ai">POSE + SKELETON + HUD</span>
+    </div>
+    {'<video id="vidAnn" preload="auto" controls><source src="data:video/mp4;base64,' + ann_b64 + '" type="video/mp4"></video>' if ann_b64 else '<div style="padding:40px;text-align:center;color:#64748b;">⚠️ Annotated video not generated yet.</div>'}
+  </div>
+</div>
+
+<script>
+(function() {{
+  var raw = document.getElementById('vidRaw');
+  var ann = document.getElementById('vidAnn');
+  var status = document.getElementById('syncStatus');
+  var syncing = false;
+
+  function fmt(t) {{
+    var m = Math.floor(t/60), s = (t%60).toFixed(2);
+    return m + ':' + (s < 10 ? '0' : '') + s;
+  }}
+
+  window.playBoth = function() {{
+    if (!raw || !ann) return;
+    ann.currentTime = raw.currentTime;
+    raw.play(); ann.play();
+    status.textContent = 'Playing — both videos synced';
+  }};
+
+  window.pauseBoth = function() {{
+    if (raw) raw.pause();
+    if (ann) ann.pause();
+    status.textContent = 'Paused at ' + fmt(raw ? raw.currentTime : 0);
+  }};
+
+  window.resetBoth = function() {{
+    if (raw) {{ raw.pause(); raw.currentTime = 0; }}
+    if (ann) {{ ann.pause(); ann.currentTime = 0; }}
+    status.textContent = 'Reset — click ▶ Play Both to start';
+  }};
+
+  // Sync ann → raw when user scrubs raw
+  if (raw) raw.addEventListener('seeked', function() {{
+    if (ann && !syncing) {{ syncing=true; ann.currentTime = raw.currentTime; syncing=false; }}
+    status.textContent = 'Seeked to ' + fmt(raw.currentTime);
+  }});
+
+  // Sync raw → ann when user scrubs ann
+  if (ann) ann.addEventListener('seeked', function() {{
+    if (raw && !syncing) {{ syncing=true; raw.currentTime = ann.currentTime; syncing=false; }}
+    status.textContent = 'Seeked to ' + fmt(ann.currentTime);
+  }});
+
+  // Keep in sync during playback every 2s
+  if (raw && ann) {{
+    setInterval(function() {{
+      if (!raw.paused && Math.abs(raw.currentTime - ann.currentTime) > 0.25) {{
+        ann.currentTime = raw.currentTime;
+      }}
+      if (!raw.paused) {{
+        status.textContent = '▶ ' + fmt(raw.currentTime) + ' / ' + fmt(raw.duration || 0);
+      }}
+    }}, 2000);
+  }}
+}})();
+</script>
+"""
+            st.markdown(dual_player_html, unsafe_allow_html=True)
+
+            # Rep quick-jump reference strip
+            if reps:
+                st.markdown("<h4 style='color:#ffffff;margin-top:14px;'>⏱ Quick Rep Turnaround Reference</h4>", unsafe_allow_html=True)
+                rep_cols = st.columns(len(reps))
+                for idx, r in enumerate(reps):
+                    with rep_cols[idx]:
+                        st.markdown(f"""
+                        <div class="card" style="padding:14px;text-align:center;">
+                          <div style="font-weight:700;color:#38bdf8;font-size:0.95rem;">Repetition {r['rep_number']}</div>
+                          <div style="font-family:'JetBrains Mono';font-size:0.88rem;color:#cbd5e1;margin-top:4px;">
+                            Bottom @ <strong>{r['bottom_timestamp']:.2f}s</strong>
+                          </div>
+                          <div style="font-size:0.78rem;color:#94a3b8;margin-top:2px;">
+                            Duration: {r['duration_sec']:.1f}s
+                          </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+        # ── TAB 2: Rep-by-Rep Audit ───────────────────────────────────────────
         with tab2:
             if not reps:
-                st.warning("No squat repetitions detected in the video.")
+                st.warning("⚠️ No completed squat repetitions were detected in this video segment.")
             else:
                 rep_labels = [f"Repetition {r['rep_number']}" for r in reps]
-                sel_rep    = st.selectbox("Select Rep:", rep_labels)
-                rep_data   = reps[rep_labels.index(sel_rep)]
+                sel_rep = st.selectbox("Select Repetition to Inspect:", rep_labels, key="rep_audit_select")
+                rep_idx = rep_labels.index(sel_rep)
+                rep_data = reps[rep_idx]
 
-                st.markdown(f"### 🔍 Audit — Rep {rep_data['rep_number']}")
-                st.caption(
-                    f"Bottom @ **{rep_data['bottom_timestamp']:.2f} s** &nbsp;|&nbsp; "
-                    f"Total **{rep_data['duration_sec']:.2f} s** "
-                    f"(↓ {rep_data['descent_duration_sec']:.1f}s, ↑ {rep_data['ascent_duration_sec']:.1f}s)"
-                )
+                rep_passes = sum(1 for f in rep_data.get("findings", []) if f["status"] == "MEETS_STANDARD")
+                rep_total = len(rep_data.get("findings", []))
+                rep_pct = (rep_passes / rep_total * 100) if rep_total else 0
 
-                for f in rep_data.get("findings", []):
-                    st_map = {
-                        "MEETS_STANDARD":         ("status-badge-pass",   "✅ MEETS STANDARD"),
-                        "DOES_NOT_MEET_STANDARD":  ("status-badge-fail",   "❌ DOES NOT MEET STANDARD"),
-                        "CANNOT_ASSESS":           ("status-badge-cannot", "⚪ CANNOT ASSESS"),
-                    }
-                    badge_cls, badge_lbl = st_map.get(f["status"], ("status-badge-cannot", f["status"]))
-                    st.markdown(f"""
-                    <div class="card">
-                      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-                        <h4 style="margin:0;color:#f1f5f9;">{f['name']}</h4>
-                        <span class="{badge_cls}">{badge_lbl}</span>
+                # Rep Kinematic Glance Strip
+                st.markdown(f"""
+                <div class="card" style="margin-bottom:16px;background:rgba(20,30,54,0.85);display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;">
+                  <div>
+                    <h3 style="margin:0;color:#ffffff;font-size:1.35rem;">🔍 Audit Results — Repetition {rep_data['rep_number']}</h3>
+                    <p style="color:#cbd5e1;font-size:0.88rem;margin:4px 0 0;">
+                      Bottom Inflection: <strong>t = {rep_data['bottom_timestamp']:.2f} s</strong> (Frame #{rep_data['bottom_frame']})
+                    </p>
+                  </div>
+                  <div style="display:flex;gap:16px;align-items:center;">
+                    <div style="text-align:right;">
+                      <div style="font-size:0.75rem;color:#94a3b8;text-transform:uppercase;font-weight:700;">Descent / Ascent Split</div>
+                      <div style="font-family:'JetBrains Mono';font-size:0.95rem;color:#38bdf8;">
+                        ↓ {rep_data['descent_duration_sec']:.1f}s &nbsp;|&nbsp; ↑ {rep_data['ascent_duration_sec']:.1f}s
                       </div>
-                      <p style="margin:4px 0;color:#94a3b8;font-size:.88rem;">
-                        <strong>Observed:</strong> {f['observed']}
+                    </div>
+                    <span class="status-badge {'status-badge-pass' if rep_pct >= 80 else ('status-badge-fail' if rep_pct < 50 else 'status-badge-cannot')}">
+                      {rep_passes}/{rep_total} Passed ({rep_pct:.0f}%)
+                    </span>
+                  </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+                # Render structured finding cards
+                for f in rep_data.get("findings", []):
+                    st_val = f["status"]
+                    if st_val == "MEETS_STANDARD":
+                        card_class = "audit-card audit-card-pass"
+                        badge_html = '<span class="status-badge status-badge-pass">✅ MEETS STANDARD</span>'
+                    elif st_val == "DOES_NOT_MEET_STANDARD":
+                        card_class = "audit-card audit-card-fail"
+                        badge_html = '<span class="status-badge status-badge-fail">❌ DOES NOT MEET STANDARD</span>'
+                    else:
+                        card_class = "audit-card audit-card-cannot"
+                        badge_html = '<span class="status-badge status-badge-cannot">⚪ CANNOT ASSESS</span>'
+
+                    st.markdown(f"""
+                    <div class="{card_class}">
+                      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;">
+                        <div>
+                          <h4 style="margin:0 0 6px 0;font-size:1.15rem;color:#ffffff;">{f['name']}</h4>
+                          <span class="observed-pill">📐 {f['observed']}</span>
+                        </div>
+                        {badge_html}
+                      </div>
+                      <p style="margin:8px 0;color:#cbd5e1;font-size:0.94rem;line-height:1.6;">
+                        {f['explanation']}
                       </p>
-                      <p style="margin:4px 0;color:#cbd5e1;">{f['explanation']}</p>
-                      <p style="margin:8px 0 0;color:#38bdf8;font-size:.86rem;">
-                        💡 <strong>Feedback:</strong> {f['actionable_feedback']}
-                      </p>
-                      <div style="margin-top:10px;">
+                      <div style="margin-top:12px;padding:10px 14px;background:rgba(6,182,212,0.12);border-left:4px solid #06b6d4;border-radius:4px;">
+                        <span style="color:#38bdf8;font-size:0.88rem;font-weight:700;">💡 Actionable Coaching Cue:</span>
+                        <span style="color:#f8fafc;font-size:0.88rem;"> {f['actionable_feedback']}</span>
+                      </div>
+                      <div style="margin-top:12px;">
                         <span class="citation-pill">
-                          📖 {f['citation']['ref_pages']} ({f['citation']['pdf_pages']}) · {f['citation']['section']}
+                          📖 Ref: {f['citation']['ref_pages']} ({f['citation']['pdf_pages']}) · {f['citation'].get('figure', '')} · {f['citation']['section']}
                         </span>
                       </div>
                     </div>
                     """, unsafe_allow_html=True)
 
-        # TAB 3: Telemetry
+        # ── TAB 3: Biomechanics Telemetry ─────────────────────────────────────
         with tab3:
-            st.subheader("Biomechanical Trajectory Plots")
+            st.markdown("<h3 style='color:#ffffff;'>📊 Continuous Kinematic Trajectory</h3>", unsafe_allow_html=True)
             tel = result.get("frames_telemetry", [])
             if tel:
+                valid_tel = [tf for tf in tel if tf.get("valid", False)]
                 df = pd.DataFrame([
                     {
-                        "Timestamp (s)":           tf.get("timestamp", 0),
-                        "Knee Angle (°)":          tf.get("knee_angle", 0),
-                        "Back Angle (°)":          tf.get("back_angle", 0),
-                        "Bar Midfoot Offset (px)": tf.get("bar_dev_px", 0),
+                        "Time (s)": tf.get("timestamp", 0),
+                        "Knee Flexion Angle (°)": tf.get("knee_angle", 0),
+                        "Torso Back Angle (°)": tf.get("back_angle", 0),
+                        "Bar Horizontal Drift (px)": tf.get("bar_dev_px", 0),
                     }
-                    for tf in tel if tf.get("valid", False)
+                    for tf in valid_tel
                 ])
-                cc1, cc2 = st.columns(2)
-                with cc1:
-                    st.caption("**Joint & Torso Angles over Time**")
-                    st.line_chart(df.set_index("Timestamp (s)")[["Knee Angle (°)", "Back Angle (°)"]])
-                with cc2:
-                    st.caption("**Barbell Horizontal Offset from Midfoot**")
-                    st.line_chart(df.set_index("Timestamp (s)")[["Bar Midfoot Offset (px)"]])
 
-        # TAB 4: Skill Inspector
+                # Telemetry KPI Strip
+                if not df.empty:
+                    min_knee = df["Knee Flexion Angle (°)"].min()
+                    min_back = df["Torso Back Angle (°)"].min()
+                    max_drift = df["Bar Horizontal Drift (px)"].abs().max()
+
+                    t1, t2, t3 = st.columns(3)
+                    t1.metric("🦵 Max Knee Flexion", f"{min_knee:.1f}°")
+                    t2.metric("📐 Min Torso Angle", f"{min_back:.1f}°", help="Target low-bar back angle: 40°–50° at bottom")
+                    t3.metric("⚖️ Max Barbell Drift", f"{max_drift:.1f} px", help="Target: 0 px deviation from midfoot line")
+
+                st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
+
+                col_chart1, col_chart2 = st.columns(2)
+                with col_chart1:
+                    st.markdown("""
+                    <div class="card" style="padding:16px;">
+                      <h4 style="font-size:1.0rem;margin-bottom:4px;color:#38bdf8;">📈 Joint & Torso Angles over Time</h4>
+                      <p style="font-size:0.84rem;color:#cbd5e1;margin:0 0 10px 0;">Knee flexion vs Torso angle (ground-relative). Notice inflection points at bottom.</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    st.line_chart(df.set_index("Time (s)")[["Knee Flexion Angle (°)", "Torso Back Angle (°)"]])
+
+                with col_chart2:
+                    st.markdown("""
+                    <div class="card" style="padding:16px;">
+                      <h4 style="font-size:1.0rem;margin-bottom:4px;color:#38bdf8;">⚖️ Barbell Balance vs Midfoot Plumb Line</h4>
+                      <p style="font-size:0.84rem;color:#cbd5e1;margin:0 0 10px 0;">Horizontal displacement (px) from center of foot arch. Ideal path is 0.</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    st.line_chart(df.set_index("Time (s)")[["Bar Horizontal Drift (px)"]])
+
+                # Export CSV button
+                csv_bytes = df.to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    label="📥 Export Kinematic Telemetry (.CSV)",
+                    data=csv_bytes,
+                    file_name="squat_telemetry_analysis.csv",
+                    mime="text/csv",
+                    use_container_width=False
+                )
+
+        # ── TAB 4: Skill Rule Inspector ───────────────────────────────────────
         with tab4:
-            st.subheader("📖 Document-Derived Skill Rule Base")
-            st.caption("Rules extracted from **Document_for_skill.pdf** — each criterion includes a page citation.")
+            st.markdown("""
+            <div class="card" style="margin-bottom:16px;">
+              <h3 style="margin:0 0 6px 0;color:#ffffff;">
+                📖 Document-Derived Starting Strength Skill Base
+              </h3>
+              <p style="color:#cbd5e1;font-size:0.92rem;margin:0;">
+                7 criteria extracted from <em>Document_for_skill.pdf</em> (Starting Strength standards). Each rule maps to authoritative page citations and figures.
+              </p>
+            </div>
+            """, unsafe_allow_html=True)
+
             engine = SquatSkillEngine()
             for rule_id, rule in engine.rules.items():
-                icon = "✅" if rule["assessable_from_side_view"] else "⚪"
+                is_side = rule.get("assessable_from_side_view", True)
+                icon = "✅" if is_side else "⚪"
+                side_badge = '<span class="status-badge status-badge-pass">Side-View Assessable</span>' if is_side else '<span class="status-badge status-badge-cannot">Requires Front / Rear View</span>'
+
                 with st.expander(f"{icon} {rule['name']}  ·  {rule['category']}"):
-                    st.markdown(f"**Description:** {rule['description']}")
-                    side = "✅ Yes" if rule["assessable_from_side_view"] else "⚪ No (requires front/top camera)"
-                    st.markdown(f"**Assessable from Side-View:** {side}")
-                    st.markdown(
-                        f"**Citation:** {rule['citation']['ref_pages']} "
-                        f"({rule['citation']['pdf_pages']}) · {rule['citation']['section']}"
-                    )
+                    st.markdown(f"""
+                    <div style="margin-bottom:12px;">
+                      {side_badge}
+                      <span class="citation-pill" style="margin-left:8px;">
+                        📖 Ref: {rule['citation']['ref_pages']} ({rule['citation']['pdf_pages']}) · {rule['citation'].get('figure', '')} · {rule['citation']['section']}
+                      </span>
+                    </div>
+                    <p style="color:#f8fafc;font-size:0.94rem;line-height:1.6;"><strong>Description:</strong> {rule['description']}</p>
+                    """, unsafe_allow_html=True)
+
                     col_p, col_f = st.columns(2)
                     with col_p:
-                        st.success(f"✅ Pass: {rule['pass_message']}")
+                        st.success(f"**Standard Criteria:** {rule['pass_message']}")
                     with col_f:
-                        st.error(f"❌ Fail: {rule['fail_message']}")
+                        st.error(f"**Fault Criteria:** {rule['fail_message']}")
 
-        # TAB 5: Live Camera Counter
+        # ── TAB 5: Live Camera Counter ────────────────────────────────────────
         with tab5:
             _render_live_camera()
 
+elif app_mode == "📷 Live Camera Counter":
+    _render_live_camera()
+
 else:
-    # No video loaded yet
-    if app_mode == "📷 Live Camera Counter":
-        _render_live_camera()
-    else:
+    # ── Landing Hero Showcase (when no video is analyzed yet) ───────────────────
+    st.markdown("""
+    <div class="card" style="padding:42px 32px;text-align:center;margin-top:10px;background:linear-gradient(145deg,#0f172a,#1e293b);">
+      <div style="display:inline-block;background:linear-gradient(135deg,#6366f1,#06b6d4);padding:14px;border-radius:20px;box-shadow:0 0 30px rgba(99,102,241,0.5);margin-bottom:18px;">
+        <span style="font-size:2.8rem;">🏋️</span>
+      </div>
+      <h2 style="font-size:2.2rem;margin-bottom:10px;color:#ffffff;">
+        AI Barbell Squat Biomechanics & Skill Evaluator
+      </h2>
+      <p style="color:#cbd5e1;font-size:1.05rem;max-width:720px;margin:0 auto 24px;line-height:1.6;">
+        Computer vision motion analysis grounded in Starting Strength low-bar squat standards.
+        Instant video playback, anatomical depth tracking, midfoot balance lines, and document citations.
+      </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # 4 Feature Showcase Cards
+    f1, f2, f3, f4 = st.columns(4)
+    with f1:
         st.markdown("""
-        <div style="text-align:center;padding:60px 20px;color:#475569;">
-          <div style="font-size:3.5rem;margin-bottom:16px;">🏋️</div>
-          <h3 style="color:#64748b;font-family:'Outfit',sans-serif;">
-            Select a video source in the sidebar to begin analysis
-          </h3>
-          <p style="color:#334155;font-size:.9rem;">
-            Use the <strong>Common YouTube Sample</strong> or upload your own side-view squat video,
-            then click <strong>🚀 Run AI Squat Assessment</strong>.<br/><br/>
-            Or switch to <strong>📷 Live Camera Counter</strong> in the sidebar for real-time rep counting
-            using your laptop camera — no video file needed.
+        <div class="card" style="height:100%;padding:20px;">
+          <div style="font-size:1.8rem;margin-bottom:10px;">🎥</div>
+          <h4 style="font-size:1.1rem;color:#38bdf8;margin-bottom:6px;">Dual Video Studio</h4>
+          <p style="color:#cbd5e1;font-size:0.88rem;line-height:1.5;">
+            Side-by-side native video player comparing raw movement against AI skeletal and barbell overlays.
           </p>
         </div>
         """, unsafe_allow_html=True)
+
+    with f2:
+        st.markdown("""
+        <div class="card" style="height:100%;padding:20px;">
+          <div style="font-size:1.8rem;margin-bottom:10px;">📐</div>
+          <h4 style="font-size:1.1rem;color:#38bdf8;margin-bottom:6px;">Patella-Crease Depth</h4>
+          <p style="color:#cbd5e1;font-size:0.88rem;line-height:1.5;">
+            Detects hip crease apex vs patella top. Validates below-parallel standards (Fig 2-1 & 2-10).
+          </p>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with f3:
+        st.markdown("""
+        <div class="card" style="height:100%;padding:20px;">
+          <div style="font-size:1.8rem;margin-bottom:10px;">⚖️</div>
+          <h4 style="font-size:1.1rem;color:#38bdf8;margin-bottom:6px;">Midfoot Plumb Line</h4>
+          <p style="color:#cbd5e1;font-size:0.88rem;line-height:1.5;">
+            Barbell trajectory ribbon color-coded to horizontal deviation from the midfoot balance point.
+          </p>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with f4:
+        st.markdown("""
+        <div class="card" style="height:100%;padding:20px;">
+          <div style="font-size:1.8rem;margin-bottom:10px;">📖</div>
+          <h4 style="font-size:1.1rem;color:#38bdf8;margin-bottom:6px;">Document Citations</h4>
+          <p style="color:#cbd5e1;font-size:0.88rem;line-height:1.5;">
+            Every finding cites Starting Strength page numbers, figure diagrams, and coaching cues.
+          </p>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("""
+    <div style="text-align:center;margin-top:24px;">
+      <span style="color:#cbd5e1;font-size:0.92rem;">
+        Ready to test? Select <strong>🎥 YouTube Video / Benchmark Sample</strong> above and click <strong>🚀 Run AI Assessment</strong>.
+      </span>
+    </div>
+    """, unsafe_allow_html=True)
