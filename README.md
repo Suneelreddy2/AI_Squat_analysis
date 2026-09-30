@@ -43,6 +43,8 @@ streamlit run app.py
 
 Open your browser at `http://localhost:8501`.
 
+For live camera access, open the app on the same computer using `localhost`. Browsers require a secure page for webcam access: remote or LAN access must use HTTPS. In the live counter, start the camera to begin recording, stop the camera to save the clip, then select **Analyze recording** to open the full report with the raw video, annotated video, rep audit, and telemetry.
+
 ## 📁 Project Structure
 
 ```

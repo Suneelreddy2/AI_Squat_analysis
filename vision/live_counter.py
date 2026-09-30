@@ -8,6 +8,7 @@ annotated with overlays, and sent back to the browser.
 import math
 import time
 import threading
+import os
 import numpy as np
 import cv2
 import mediapipe as mp
@@ -33,6 +34,11 @@ class LiveRepCounter:
 
     def __init__(self, smoothing_window: int = 9):
         self.lock = threading.Lock()
+        self._record_lock = threading.Lock()
+        self._recording = False
+        self._record_path = None
+        self._record_writer = None
+        self._record_frame_count = 0
 
         # MediaPipe Pose (lightweight, low-latency)
         self.pose = _mp_pose.Pose(
@@ -85,6 +91,63 @@ class LiveRepCounter:
             self._hip_buf.clear()
             self._smooth_buf.clear()
             self._bar_hist.clear()
+            self._metrics.update({
+                "rep_count": 0,
+                "phase": "STANDING",
+                "knee_angle": 0.0,
+                "back_angle": 0.0,
+                "depth_ok": False,
+                "pose_conf": 0.0,
+            })
+
+    def start_recording(self, output_dir: str = "output") -> bool:
+        """Begin saving raw camera frames; open the writer on the next frame."""
+        os.makedirs(output_dir, exist_ok=True)
+        with self._record_lock:
+            if self._recording:
+                return False
+            self._record_path = os.path.join(
+                output_dir, f"live_recording_{int(time.time() * 1000)}.mp4"
+            )
+            self._record_writer = None
+            self._record_frame_count = 0
+            self._recording = True
+            return True
+
+    def stop_recording(self):
+        """Stop recording and return the raw video path when frames were saved."""
+        with self._record_lock:
+            self._recording = False
+            if self._record_writer is not None:
+                self._record_writer.release()
+                self._record_writer = None
+            path = self._record_path if self._record_frame_count else None
+            self._record_path = None
+            self._record_frame_count = 0
+            return path
+
+    def _write_recording_frame(self, frame: np.ndarray):
+        with self._record_lock:
+            if not self._recording:
+                return
+            height, width = frame.shape[:2]
+            if self._record_writer is None:
+                size = (width, height)
+                self._record_writer = cv2.VideoWriter(
+                    self._record_path, cv2.VideoWriter_fourcc(*"avc1"), 30.0, size
+                )
+                if not self._record_writer.isOpened():
+                    self._record_writer.release()
+                    self._record_writer = cv2.VideoWriter(
+                        self._record_path, cv2.VideoWriter_fourcc(*"mp4v"), 30.0, size
+                    )
+                if not self._record_writer.isOpened():
+                    self._record_writer.release()
+                    self._record_writer = None
+                    self._recording = False
+                    return
+            self._record_writer.write(frame)
+            self._record_frame_count += 1
 
     # ─── Frame processing (called from WebRTC worker thread) ─────────────────
     def process_frame(self, bgr: np.ndarray) -> np.ndarray:
@@ -93,7 +156,11 @@ class LiveRepCounter:
         res  = self.pose.process(rgb)
 
         if not res.pose_landmarks:
-            return self._draw_hud(bgr, {})
+            with self.lock:
+                self._metrics["pose_conf"] = 0.0
+            out = self._draw_hud(bgr, {})
+            self._write_recording_frame(bgr)
+            return out
 
         lm_raw = res.pose_landmarks.landmark
 
@@ -137,7 +204,7 @@ class LiveRepCounter:
         self._smooth_buf.append(smooth_y)
 
         # Update rep state machine
-        phase = self._update_rep_state(smooth_y, tel)
+        phase = self._update_rep_state(smooth_y, tel, conf)
 
         # Annotate
         out = self.annotator.annotate_frame(
@@ -151,10 +218,11 @@ class LiveRepCounter:
 
         # Overlay large rep counter
         out = self._draw_hud(out, tel, phase, conf)
+        self._write_recording_frame(bgr)
         return out
 
     # ─── State machine ────────────────────────────────────────────────────────
-    def _update_rep_state(self, smooth_y: float, tel: dict) -> str:
+    def _update_rep_state(self, smooth_y: float, tel: dict, pose_conf: float) -> str:
         """
         Hip Y increases downward in image space.
         STANDING  → high hip (small Y)
@@ -171,12 +239,11 @@ class LiveRepCounter:
             return self._phase
 
         depth_threshold = self._y_baseline + 40   # must travel at least 40px
-        bottom_threshold = self._y_baseline + 80  # clearly in descent
-
         if self._phase == "STANDING":
             if smooth_y > depth_threshold:
                 self._phase   = "DESCENT"
                 self._y_bottom = smooth_y
+                self._depth_ok = False
 
         elif self._phase == "DESCENT":
             if smooth_y > (self._y_bottom or smooth_y):
@@ -186,7 +253,15 @@ class LiveRepCounter:
                 recent = list(self._smooth_buf)[-3:]
                 if recent[-1] < recent[-2] - 1.5:
                     self._depth_ok = is_deep
-                    self._phase    = "ASCENT"
+                    self._phase    = "BOTTOM"
+
+        elif self._phase == "BOTTOM":
+            # Hold a distinct turnaround phase for at least one processed frame,
+            # then move into ascent once upward motion continues.
+            if len(self._smooth_buf) >= 3:
+                recent = list(self._smooth_buf)[-3:]
+                if recent[-1] < recent[-2] - 1.5:
+                    self._phase = "ASCENT"
 
         elif self._phase == "ASCENT":
             # Rep complete when back at ~standing height
@@ -194,6 +269,7 @@ class LiveRepCounter:
                 self._rep_count += 1
                 self._last_rep_t = time.time()
                 self._phase      = "STANDING"
+                self._y_bottom   = None
                 # Refresh baseline
                 self._y_baseline = smooth_y
 
@@ -204,7 +280,7 @@ class LiveRepCounter:
                 "knee_angle": tel.get("knee_angle", 0.0),
                 "back_angle": tel.get("back_angle", 0.0),
                 "depth_ok":   self._depth_ok,
-                "pose_conf":  0.0,
+                "pose_conf":  pose_conf,
             })
         return self._phase
 

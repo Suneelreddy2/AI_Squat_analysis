@@ -32,7 +32,10 @@ class BarbellTracker:
         y2 = min(h, int(est_bar_y + roi_size))
 
         detected_bar = None
-        conf = 0.6 # Base confidence from pose anchor
+        # A shoulder-anchored estimate is only a fallback, not a detected bar.
+        # Keep its confidence below the processor's tracked threshold so the
+        # report does not present this proxy as a measured bar path.
+        conf = 0.3
 
         if x2 > x1 and y2 > y1:
             roi = frame[y1:y2, x1:x2]

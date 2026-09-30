@@ -1,9 +1,10 @@
 import os
 import sys
 import tempfile
-import time
+import hashlib
 import subprocess
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import numpy as np
 try:
@@ -55,43 +56,23 @@ else:
 
 def _render_live_camera():
     """Live interactive webcam studio panel."""
-    st.markdown("""
-    <div class="card" style="margin-bottom:18px;">
-      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
+    st.markdown(f"""
+    <div class="card" style="padding:16px 20px;margin-bottom:14px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
         <div>
-          <h3 style="margin:0;color:#ffffff;font-size:1.35rem;">
-            📷 Real-Time Biomechanics & Rep Counter
-          </h3>
-          <p style="color:#cbd5e1;font-size:0.9rem;margin:4px 0 0;">
-            Stand <strong>sideways (profile view)</strong> 6–8 feet from camera. Tracks full-body kinematics & counts reps live.
-          </p>
+          <h3 style="margin:0;color:#fff;font-size:1.25rem;">Live squat session</h3>
+          <p style="margin:3px 0 0;color:#cbd5e1;font-size:.88rem;">Side profile · full body in frame · camera at hip height</p>
         </div>
-        <div style="display:flex;gap:8px;">
-          <span class="status-badge status-badge-pass">● WebRTC Active</span>
-          <span class="citation-pill">MediaPipe Pose v0.10</span>
-        </div>
+        <span class="citation-pill">Live camera analysis</span>
       </div>
     </div>
     """, unsafe_allow_html=True)
 
-    c_stream, c_setup = st.columns([3, 1])
-
-    with c_setup:
-        st.markdown("""
-        <div class="card" style="padding:18px;">
-          <h4 style="font-size:1.0rem;margin-bottom:10px;color:#38bdf8;">🎯 Setup Guide</h4>
-          <ul style="font-size:0.88rem;color:#cbd5e1;padding-left:18px;line-height:1.7;">
-            <li>Position camera at <strong>hip height</strong></li>
-            <li>Stand in <strong>side profile view</strong> (facing 90° from camera)</li>
-            <li>Ensure full body is visible (head to heels)</li>
-            <li>Reps increment upon rising to full standing extension</li>
-          </ul>
-        </div>
-        """, unsafe_allow_html=True)
-
     if not HAS_WEBRTC:
-        st.warning("⚠️ `streamlit-webrtc` and `av` packages are required for real-time webcam processing. Run `pip install streamlit-webrtc av` to enable live camera analysis.")
-        return
+        st.warning("streamlit-webrtc and av are required for live camera recording. Install them with pip install streamlit-webrtc av." )
+        return None
+
+    c_stream, c_setup = st.columns([2, 1], gap="large")
 
     with c_stream:
         RTC_CONFIG = RTCConfiguration(
@@ -106,43 +87,80 @@ def _render_live_camera():
             async_processing=True,
         )
 
-    st.markdown("<h4 style='color:#ffffff;margin-top:16px;'>📊 Live Kinematic Telemetry</h4>", unsafe_allow_html=True)
-    k1, k2, k3, k4, k5 = st.columns(5)
-    slot_reps  = k1.empty()
-    slot_phase = k2.empty()
-    slot_knee  = k3.empty()
-    slot_back  = k4.empty()
-    slot_depth = k5.empty()
+    with c_setup:
+        with st.container(border=True):
+            st.markdown("#### Session setup")
+            st.markdown(
+                "1. Place the camera at hip height.\n"
+                "2. Stand sideways to the camera.\n"
+                "3. Keep your head, hips, knees, and feet visible."
+            )
+            st.info("Use http://localhost:8501 on this computer. Camera access requires HTTPS when opening the app through a LAN or remote address.")
 
-    slot_reps.metric("🔁 Total Reps", "0")
-    slot_phase.metric("🧩 Phase", "⏸ STANDING")
-    slot_knee.metric("🦵 Knee Flexion", "—")
-    slot_back.metric("📐 Torso Angle", "—")
-    slot_depth.metric("📉 Depth Crease", "—")
+    counter = getattr(ctx.video_processor, "counter", None) if ctx else None
+    if counter is not None:
+        st.session_state["live_counter"] = counter
+    else:
+        counter = st.session_state.get("live_counter")
+    camera_playing = bool(ctx and ctx.state.playing)
+    recording_active = st.session_state.get("live_recording_active", False)
+    if counter and camera_playing and not recording_active:
+        st.session_state.pop("live_recording_path", None)
+        st.session_state.pop("analysis_result", None)
+        st.session_state.pop("active_video", None)
+        counter.reset()
+        st.session_state["live_recording_active"] = counter.start_recording("output")
+        recording_active = st.session_state["live_recording_active"]
+    elif counter and not camera_playing and recording_active:
+        saved_path = counter.stop_recording()
+        st.session_state["live_recording_active"] = False
+        recording_active = False
+        if saved_path:
+            st.session_state["live_recording_path"] = saved_path
 
-    r_col1, r_col2 = st.columns([1.5, 4])
-    with r_col1:
-        if st.button("🔄 Reset Live Counter", key="live_reset_btn", use_container_width=True):
-            if ctx and ctx.video_processor:
-                ctx.video_processor.counter.reset()
+    phase_map = {
+        "BOTTOM": "🟢 AT BOTTOM", "DESCENT": "🔽 DESCENT",
+        "ASCENT": "🔼 ASCENT", "STANDING": "⏸ STANDING",
+    }
 
-    if ctx and ctx.state.playing:
-        phase_map = {
-            "BOTTOM":   "🟢 AT BOTTOM",
-            "DESCENT":  "🔽 DESCENT",
-            "ASCENT":   "🔼 ASCENT",
-            "STANDING": "⏸ STANDING",
-        }
-        while ctx.state.playing:
-            time.sleep(0.4)
-            if not ctx.video_processor:
-                break
-            m = ctx.video_processor.counter.get_metrics()
-            slot_reps.metric("🔁 Total Reps", str(m['rep_count']))
-            slot_phase.metric("🧩 Phase", phase_map.get(m['phase'], m['phase']))
-            slot_knee.metric("🦵 Knee Flexion", f"{m['knee_angle']:.0f}°")
-            slot_back.metric("📐 Torso Angle", f"{m['back_angle']:.0f}°")
-            slot_depth.metric("📉 Depth Crease", "✅ PASSED" if m['depth_ok'] else "⏳ NOT YET")
+    with st.container(border=True):
+        st.markdown("#### Live telemetry")
+        k1, k2, k3, k4, k5 = st.columns(5)
+        slot_reps, slot_phase, slot_knee, slot_back, slot_depth = [
+            col.empty() for col in (k1, k2, k3, k4, k5)
+        ]
+
+        def render_live_metrics():
+            metrics = counter.get_metrics() if counter else {}
+            slot_reps.metric("Reps", str(metrics.get("rep_count", 0)))
+            slot_phase.metric("Phase", phase_map.get(metrics.get("phase"), "⏸ STANDING"))
+            slot_knee.metric("Knee angle", f"{metrics.get('knee_angle', 0):.0f}°")
+            slot_back.metric("Torso angle", f"{metrics.get('back_angle', 0):.0f}°")
+            slot_depth.metric("Last rep depth", "✅ Passed" if metrics.get("depth_ok") else "—")
+
+        if hasattr(st, "fragment"):
+            @st.fragment(run_every=1)
+            def refresh_live_metrics():
+                render_live_metrics()
+            refresh_live_metrics()
+        else:
+            render_live_metrics()
+
+        controls = st.columns([2.2, 1.5])
+        with controls[0]:
+            if recording_active:
+                st.success("Recording while camera is on · stop the camera to finish")
+            elif st.session_state.get("live_recording_path"):
+                st.success("Recording saved · ready to analyze")
+            else:
+                st.caption("Start the camera to begin recording; stop it to save the clip.")
+        with controls[1]:
+            recorded_path = st.session_state.get("live_recording_path")
+            if recorded_path and os.path.isfile(recorded_path):
+                st.caption(f"Saved · {os.path.basename(recorded_path)}")
+                if st.button("Analyze recording", key="live_analyze_recording", use_container_width=True):
+                    return recorded_path
+    return None
 
 
 # ── Top Navigation Header & Brand Bar ─────────────────────────────────────────
@@ -219,7 +237,11 @@ if app_mode == "📂 Video Analysis Studio":
         if is_default and os.path.exists(sample_video_path):
             selected_video_path = sample_video_path
         else:
-            if "custom_yt_path" in st.session_state and os.path.exists(st.session_state["custom_yt_path"]):
+            if (
+                st.session_state.get("custom_yt_url") == yt_url.strip()
+                and "custom_yt_path" in st.session_state
+                and os.path.exists(st.session_state["custom_yt_path"])
+            ):
                 selected_video_path = st.session_state["custom_yt_path"]
 
         with ctrl_col3:
@@ -228,14 +250,14 @@ if app_mode == "📂 Video Analysis Studio":
                 if st.button("⬇️ Download Video", use_container_width=True):
                     with st.spinner("Downloading with yt-dlp..."):
                         os.makedirs("samples", exist_ok=True)
-                        custom_path = os.path.join("samples", "custom_yt_input.mp4")
-                        if os.path.exists(custom_path):
-                            os.remove(custom_path)
+                        url_key = hashlib.sha256(yt_url.strip().encode("utf-8")).hexdigest()[:12]
+                        custom_path = os.path.join("samples", f"custom_yt_{url_key}.mp4")
                         try:
                             cmd = [sys.executable, "-m", "yt_dlp", "-f", "mp4", "-o", custom_path, yt_url]
                             res = subprocess.run(cmd, capture_output=True, text=True)
                             if res.returncode == 0 and os.path.exists(custom_path):
                                 st.session_state["custom_yt_path"] = custom_path
+                                st.session_state["custom_yt_url"] = yt_url.strip()
                                 st.success("Video downloaded successfully!")
                                 st.rerun()
                             else:
@@ -253,19 +275,34 @@ if app_mode == "📂 Video Analysis Studio":
                 key="file_uploader_control"
             )
             if uploaded:
-                tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-                tfile.write(uploaded.read())
-                tfile.close()
-                selected_video_path = tfile.name
+                video_bytes = uploaded.getvalue()
+                upload_key = hashlib.sha256(video_bytes).hexdigest()
+                if st.session_state.get("uploaded_video_key") != upload_key:
+                    suffix = os.path.splitext(uploaded.name)[1].lower() or ".mp4"
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tfile:
+                        tfile.write(video_bytes)
+                    old_path = st.session_state.get("uploaded_video_path")
+                    st.session_state["uploaded_video_path"] = tfile.name
+                    st.session_state["uploaded_video_key"] = upload_key
+                    if old_path and os.path.isfile(old_path):
+                        try:
+                            os.remove(old_path)
+                        except OSError:
+                            pass
+                selected_video_path = st.session_state["uploaded_video_path"]
         with ctrl_col3:
             st.write("")
             run_analysis = st.button("🚀 Run AI Assessment", type="primary", use_container_width=True)
 
     st.markdown("</div>", unsafe_allow_html=True)
 
+if app_mode == "📷 Live Camera Counter":
+    submitted_recording = _render_live_camera()
+    selected_video_path = st.session_state.get("live_recording_path")
+    run_analysis = bool(submitted_recording)
 
 # ── Processing & Main Dashboard View ──────────────────────────────────────────
-if selected_video_path and app_mode == "📂 Video Analysis Studio":
+if selected_video_path and app_mode in ("📂 Video Analysis Studio", "📷 Live Camera Counter"):
     need_run = (
         run_analysis
         or "analysis_result" not in st.session_state
@@ -301,28 +338,32 @@ if selected_video_path and app_mode == "📂 Video Analysis Studio":
         reps = result.get("repetitions", [])
 
         # Executive KPI Row
-        total_ev = sum(len(r["findings"]) for r in reps)
+        all_findings = [f for rep in reps for f in rep.get("findings", [])]
         passes = sum(
             sum(1 for f in r["findings"] if f["status"] == "MEETS_STANDARD")
             for r in reps
         )
-        pass_rate = (passes / total_ev * 100) if total_ev > 0 else 0
+        failed_checks = sum(f["status"] == "DOES_NOT_MEET_STANDARD" for f in all_findings)
+        unassessed_checks = sum(f["status"] == "CANNOT_ASSESS" for f in all_findings)
+        total_ev = passes + failed_checks
+        pass_rate = (passes / total_ev * 100) if total_ev else 0
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("⏱ Total Duration", f"{result['duration_sec']:.1f} s")
         c2.metric("🔁 Detected Reps", f"{len(reps)} Reps")
-        c3.metric("✅ Standards Pass Rate", f"{pass_rate:.0f}%")
+        c3.metric("✅ Assessable Checks Passed", f"{pass_rate:.0f}%", help=f"{passes} passed · {failed_checks} need attention · {unassessed_checks} could not be assessed")
         c4.metric("🎬 Video Output", "H.264 MP4 Synced")
 
         st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
 
         # Tab Navigation
+        video_tab_label = "🎞️ Raw + analyzed video" if app_mode == "📷 Live Camera Counter" else "🎥 Video Analysis Studio"
         tab1, tab2, tab3, tab4, tab5 = st.tabs([
-            "🎥 Video Analysis Studio",
+            video_tab_label,
             "📋 Rep-by-Rep Audit",
             "📊 Biomechanics Telemetry",
             "📖 Skill Rule Inspector",
-            "📷 Live Camera Counter",
+            "📷 Live Session",
         ])
 
         # ── TAB 1: Clean Dual Video Analysis Studio ───────────────────────────
@@ -330,7 +371,7 @@ if selected_video_path and app_mode == "📂 Video Analysis Studio":
             ann_path = result.get("annotated_video_path")
             
             # Action & metadata toolbar
-            t_col1, t_col2 = st.columns([3, 1])
+            t_col1, t_col2, t_col3 = st.columns([3, 1, 1])
             with t_col1:
                 st.markdown(f"""
                 <div style="display:flex;gap:12px;align-items:center;margin-bottom:12px;">
@@ -341,6 +382,16 @@ if selected_video_path and app_mode == "📂 Video Analysis Studio":
                 """, unsafe_allow_html=True)
             
             with t_col2:
+                if os.path.exists(selected_video_path):
+                    with open(selected_video_path, "rb") as raw_file:
+                        st.download_button(
+                            label="Download raw",
+                            data=raw_file.read(),
+                            file_name=os.path.basename(selected_video_path),
+                            mime="video/mp4",
+                            use_container_width=True,
+                        )
+            with t_col3:
                 if ann_path and os.path.exists(ann_path):
                     with open(ann_path, "rb") as vf:
                         st.download_button(
@@ -431,9 +482,9 @@ if selected_video_path and app_mode == "📂 Video Analysis Studio":
 </style>
 
 <div class="sync-toolbar">
-  <button class="sync-btn sync-btn-play"  onclick="playBoth()">▶ Play Both</button>
-  <button class="sync-btn sync-btn-pause" onclick="pauseBoth()">⏸ Pause Both</button>
-  <button class="sync-btn sync-btn-reset" onclick="resetBoth()">⟳ Reset</button>
+  <button type="button" class="sync-btn sync-btn-play" id="playBoth">▶ Play Both</button>
+  <button type="button" class="sync-btn sync-btn-pause" id="pauseBoth">⏸ Pause Both</button>
+  <button type="button" class="sync-btn sync-btn-reset" id="resetBoth">⟳ Reset</button>
   <span class="sync-status" id="syncStatus">Ready — click ▶ Play Both to start</span>
 </div>
 
@@ -461,45 +512,47 @@ if selected_video_path and app_mode == "📂 Video Analysis Studio":
   var raw = document.getElementById('vidRaw');
   var ann = document.getElementById('vidAnn');
   var status = document.getElementById('syncStatus');
-  var syncing = false;
-
   function fmt(t) {{
     var m = Math.floor(t/60), s = (t%60).toFixed(2);
     return m + ':' + (s < 10 ? '0' : '') + s;
   }}
 
-  window.playBoth = function() {{
-    if (!raw || !ann) return;
-    ann.currentTime = raw.currentTime;
-    raw.play(); ann.play();
-    status.textContent = 'Playing — both videos synced';
-  }};
+  function align(source, target) {{
+    if (target && Number.isFinite(source.currentTime) &&
+        Math.abs(source.currentTime - target.currentTime) > 0.15) {{
+      target.currentTime = source.currentTime;
+    }}
+  }}
 
-  window.pauseBoth = function() {{
+  document.getElementById('playBoth').addEventListener('click', async function() {{
+    if (!raw) return;
+    if (ann) align(raw, ann);
+    try {{
+      await Promise.all([raw.play(), ann ? ann.play() : Promise.resolve()]);
+      status.textContent = 'Playing — both videos synced';
+    }} catch (error) {{
+      status.textContent = 'Playback could not start. Use the video controls or check browser playback permissions.';
+    }}
+  }});
+
+  document.getElementById('pauseBoth').addEventListener('click', function() {{
     if (raw) raw.pause();
     if (ann) ann.pause();
     status.textContent = 'Paused at ' + fmt(raw ? raw.currentTime : 0);
-  }};
+  }});
 
-  window.resetBoth = function() {{
+  document.getElementById('resetBoth').addEventListener('click', function() {{
     if (raw) {{ raw.pause(); raw.currentTime = 0; }}
     if (ann) {{ ann.pause(); ann.currentTime = 0; }}
     status.textContent = 'Reset — click ▶ Play Both to start';
-  }};
-
-  // Sync ann → raw when user scrubs raw
-  if (raw) raw.addEventListener('seeked', function() {{
-    if (ann && !syncing) {{ syncing=true; ann.currentTime = raw.currentTime; syncing=false; }}
-    status.textContent = 'Seeked to ' + fmt(raw.currentTime);
   }});
 
-  // Sync raw → ann when user scrubs ann
-  if (ann) ann.addEventListener('seeked', function() {{
-    if (raw && !syncing) {{ syncing=true; raw.currentTime = ann.currentTime; syncing=false; }}
-    status.textContent = 'Seeked to ' + fmt(ann.currentTime);
-  }});
+  if (raw && ann) {{
+    raw.addEventListener('seeked', function() {{ align(raw, ann); }});
+    ann.addEventListener('seeked', function() {{ align(ann, raw); }});
+  }}
 
-  // Keep in sync during playback every 2s
+  // Keep the annotated player aligned to the source while playing.
   if (raw && ann) {{
     setInterval(function() {{
       if (!raw.paused && Math.abs(raw.currentTime - ann.currentTime) > 0.25) {{
@@ -513,7 +566,7 @@ if selected_video_path and app_mode == "📂 Video Analysis Studio":
 }})();
 </script>
 """
-            st.markdown(dual_player_html, unsafe_allow_html=True)
+            components.html(dual_player_html, height=560, scrolling=False)
 
             # Rep quick-jump reference strip
             if reps:
@@ -544,7 +597,9 @@ if selected_video_path and app_mode == "📂 Video Analysis Studio":
                 rep_data = reps[rep_idx]
 
                 rep_passes = sum(1 for f in rep_data.get("findings", []) if f["status"] == "MEETS_STANDARD")
-                rep_total = len(rep_data.get("findings", []))
+                rep_failed = sum(1 for f in rep_data.get("findings", []) if f["status"] == "DOES_NOT_MEET_STANDARD")
+                rep_total = rep_passes + rep_failed
+                rep_unassessed = sum(1 for f in rep_data.get("findings", []) if f["status"] == "CANNOT_ASSESS")
                 rep_pct = (rep_passes / rep_total * 100) if rep_total else 0
 
                 # Rep Kinematic Glance Strip
@@ -564,8 +619,9 @@ if selected_video_path and app_mode == "📂 Video Analysis Studio":
                       </div>
                     </div>
                     <span class="status-badge {'status-badge-pass' if rep_pct >= 80 else ('status-badge-fail' if rep_pct < 50 else 'status-badge-cannot')}">
-                      {rep_passes}/{rep_total} Passed ({rep_pct:.0f}%)
+                      {rep_passes}/{rep_total} Assessable Checks Passed ({rep_pct:.0f}%)
                     </span>
+                    <div style="font-size:0.75rem;color:#94a3b8;">{rep_unassessed} checks could not be assessed</div>
                   </div>
                 </div>
                 """, unsafe_allow_html=True)
@@ -703,10 +759,40 @@ if selected_video_path and app_mode == "📂 Video Analysis Studio":
 
         # ── TAB 5: Live Camera Counter ────────────────────────────────────────
         with tab5:
-            _render_live_camera()
+            if app_mode == "📂 Video Analysis Studio":
+                _render_live_camera()
+            else:
+                st.info("Recording controls are available in the live camera panel above.")
+
+        if app_mode == "📷 Live Camera Counter":
+            with st.container(border=True):
+                st.markdown("### Live session outcome")
+                st.caption("Analysis is run on the saved camera recording. Unassessable checks are excluded from the pass percentage.")
+                outcome_cols = st.columns(4)
+                outcome_cols[0].metric("Completed reps", str(len(reps)))
+                outcome_cols[1].metric("Checks passed", str(passes))
+                outcome_cols[2].metric("Need attention", str(failed_checks))
+                outcome_cols[3].metric("Could not assess", str(unassessed_checks))
+
+                rep_rows = []
+                for rep in reps:
+                    rep_findings = rep.get("findings", [])
+                    depth = next((f["status"] for f in rep_findings if f.get("rule_id") == "SQUAT_DEPTH"), "CANNOT_ASSESS")
+                    rep_rows.append({
+                        "Rep": rep["rep_number"],
+                        "Duration": f"{rep.get('duration_sec', 0):.2f} s",
+                        "Depth": depth.replace("_", " ").title(),
+                        "Passed": sum(f["status"] == "MEETS_STANDARD" for f in rep_findings),
+                        "Needs attention": sum(f["status"] == "DOES_NOT_MEET_STANDARD" for f in rep_findings),
+                        "Unassessed": sum(f["status"] == "CANNOT_ASSESS" for f in rep_findings),
+                    })
+                if rep_rows:
+                    st.dataframe(pd.DataFrame(rep_rows), hide_index=True, use_container_width=True)
+                else:
+                    st.info("No complete repetitions were detected in this recording. The raw and analyzed videos are available above for review.")
 
 elif app_mode == "📷 Live Camera Counter":
-    _render_live_camera()
+    pass
 
 else:
     # ── Landing Hero Showcase (when no video is analyzed yet) ───────────────────

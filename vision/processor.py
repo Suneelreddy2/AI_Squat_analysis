@@ -1,5 +1,6 @@
 import os
 import subprocess
+import math
 import cv2
 import numpy as np
 from typing import Dict, Any, List, Optional, Callable
@@ -32,7 +33,7 @@ class SquatVideoProcessor:
             raise ValueError(f"Could not open input video: {video_path}")
 
         fps = cap.get(cv2.CAP_PROP_FPS)
-        if fps <= 0 or np.isnan(fps):
+        if not math.isfinite(fps) or fps <= 0:
             fps = 30.0
 
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -78,6 +79,9 @@ class SquatVideoProcessor:
         cap.release()
         pose_detector.close()
 
+        if not raw_frames:
+            raise ValueError(f"Input video contains no readable frames: {video_path}")
+
         if progress_callback:
             progress_callback(0.55, "Detecting repetition phases & bottom positions...")
 
@@ -98,8 +102,9 @@ class SquatVideoProcessor:
             rep_frames = frames_telemetry[start_f:end_f+1]
             valid_rep_frames = [f for f in rep_frames if f.get("valid", False)]
             
-            max_bar_dev = max([f.get("bar_dev_px", 0) for f in valid_rep_frames], default=0, key=abs)
-            max_norm_bar_dev = max([f.get("norm_bar_dev", 0) for f in valid_rep_frames], default=0)
+            tracked_rep_frames = [f for f in valid_rep_frames if f.get("bar_tracked", False)]
+            max_bar_dev = max([f.get("bar_dev_px", 0) for f in tracked_rep_frames], default=0, key=abs)
+            max_norm_bar_dev = max([f.get("norm_bar_dev", 0) for f in tracked_rep_frames], default=0)
             avg_conf = np.mean([f.get("pose_confidence", 1.0) for f in valid_rep_frames]) if valid_rep_frames else 0.0
             
             # Ascent back angle stability check
@@ -115,12 +120,17 @@ class SquatVideoProcessor:
                 "is_deep": bottom_telemetry.get("is_deep", False),
                 "max_bar_dev_px": max_bar_dev,
                 "normalized_bar_dev": max_norm_bar_dev,
-                "bar_tracked": bottom_telemetry.get("bar_tracked", True),
+                # Bar path is a full-repetition criterion; a missing detection
+                # on any valid frame means the complete path was not observed.
+                "bar_tracked": bool(valid_rep_frames) and len(tracked_rep_frames) == len(valid_rep_frames),
                 "bottom_back_angle": bottom_back,
                 "ascent_back_angle_change": ascent_change,
                 "knee_forward_over_toe_px": bottom_telemetry.get("knee_forward_px", 0.0),
                 "gaze_angle_deg": bottom_telemetry.get("gaze_angle", -15.0),
-                "hip_drive_initiated": True
+                # The current pose telemetry does not reliably distinguish
+                # hip drive from a coordinated ascent. Leave this rule
+                # unassessed until a validated movement heuristic is available.
+                "hip_drive_initiated": None
             }
 
             findings = self.skill_engine.evaluate_repetition(rep_summary_telemetry)
@@ -154,6 +164,9 @@ class SquatVideoProcessor:
             out_writer.release()
             fourcc_mp4v = cv2.VideoWriter_fourcc(*'mp4v')
             out_writer = cv2.VideoWriter(annotated_path, fourcc_mp4v, fps, (width, height))
+        if not out_writer.isOpened():
+            out_writer.release()
+            raise RuntimeError(f"Could not create annotated video: {annotated_path}")
 
         annotator = VideoAnnotator()
 
@@ -219,8 +232,8 @@ class SquatVideoProcessor:
             "video_path": video_path,
             "annotated_video_path": final_video_path,
             "fps": fps,
-            "total_frames": total_frames,
-            "duration_sec": total_frames / fps,
+            "total_frames": frame_idx,
+            "duration_sec": frame_idx / fps,
             "repetitions": evaluated_reps,
             "frames_telemetry": frames_telemetry
         }

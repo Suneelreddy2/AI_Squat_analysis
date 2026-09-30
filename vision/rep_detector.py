@@ -13,6 +13,36 @@ class RepetitionDetector:
         if not frames_telemetry:
             return []
 
+        # Process each contiguous pose-valid segment independently. Compressing
+        # valid samples across an occlusion makes frames on either side of a
+        # tracking gap appear adjacent and can invent a turnaround.
+        if any(not data.get("valid", False) or "hip_y" not in data for data in frames_telemetry):
+            segments = []
+            segment = []
+            segment_start = 0
+            for frame_idx, data in enumerate(frames_telemetry):
+                if data.get("valid", False) and "hip_y" in data:
+                    if not segment:
+                        segment_start = frame_idx
+                    segment.append(data)
+                elif segment:
+                    segments.append((segment_start, segment))
+                    segment = []
+            if segment:
+                segments.append((segment_start, segment))
+
+            repetitions = []
+            for offset, segment in segments:
+                if len(segment) < 10:
+                    continue
+                for rep in self.detect_repetitions(segment):
+                    rep["start_frame"] += offset
+                    rep["bottom_frame"] += offset
+                    rep["end_frame"] += offset
+                    rep["rep_number"] = len(repetitions) + 1
+                    repetitions.append(rep)
+            return repetitions
+
         hip_y_series = []
         knee_angle_series = []
         valid_indices = []

@@ -113,33 +113,55 @@ class SquatSkillEngine:
 
         # 5. Eye Gaze Direction
         gaze_rule = self.rules["EYE_GAZE"]
-        gaze_angle = telemetry.get("gaze_angle_deg", -20.0) # negative means looking down
-        gaze_pass = gaze_angle <= 5.0 # Looking down or neutral
-        status = "MEETS_STANDARD" if gaze_pass else "DOES_NOT_MEET_STANDARD"
-        obs_text = f"Head gaze angle: {gaze_angle:.1f}° relative to horizon"
-        findings.append({
-            "rule_id": gaze_rule["id"],
-            "name": gaze_rule["name"],
-            "status": status,
-            "citation": gaze_rule["citation"],
-            "observed": obs_text,
-            "explanation": gaze_rule["pass_message"] if gaze_pass else gaze_rule["fail_message"],
-            "actionable_feedback": "Good eyes-down gaze!" if gaze_pass else "Fix your eyes on a spot on the floor 4-5 feet ahead. Do not look up at ceiling."
-        })
+        gaze_angle = telemetry.get("gaze_angle_deg")
+        if gaze_angle is None:
+            findings.append({
+                "rule_id": gaze_rule["id"],
+                "name": gaze_rule["name"],
+                "status": "CANNOT_ASSESS",
+                "citation": gaze_rule["citation"],
+                "observed": "Eye direction is not available from pose landmarks",
+                "explanation": "The pose model provides head landmarks but not iris direction, so eye gaze cannot be measured reliably.",
+                "actionable_feedback": "Check that your eyes remain fixed on the floor 4–5 feet ahead."
+            })
+        else:
+            gaze_pass = gaze_angle <= 5.0
+            status = "MEETS_STANDARD" if gaze_pass else "DOES_NOT_MEET_STANDARD"
+            obs_text = f"Head gaze angle: {gaze_angle:.1f}° relative to horizon"
+            findings.append({
+                "rule_id": gaze_rule["id"],
+                "name": gaze_rule["name"],
+                "status": status,
+                "citation": gaze_rule["citation"],
+                "observed": obs_text,
+                "explanation": gaze_rule["pass_message"] if gaze_pass else gaze_rule["fail_message"],
+                "actionable_feedback": "Good eyes-down gaze!" if gaze_pass else "Fix your eyes on a spot on the floor 4-5 feet ahead. Do not look up at ceiling."
+            })
 
         # 6. Hip Drive
         hip_rule = self.rules["HIP_DRIVE"]
-        hip_drive_ok = telemetry.get("hip_drive_initiated", True)
-        status = "MEETS_STANDARD" if hip_drive_ok else "DOES_NOT_MEET_STANDARD"
-        findings.append({
-            "rule_id": hip_rule["id"],
-            "name": hip_rule["name"],
-            "status": status,
-            "citation": hip_rule["citation"],
-            "observed": "Hips initiated vertical ascent" if hip_drive_ok else "Hips stalled or shifted horizontally on ascent",
-            "explanation": hip_rule["pass_message"] if hip_drive_ok else hip_rule["fail_message"],
-            "actionable_feedback": "Strong hip drive!" if hip_drive_ok else "Think of a chain pulling your hips straight up out of the bottom position."
-        })
+        hip_drive_ok = telemetry.get("hip_drive_initiated")
+        if hip_drive_ok is None:
+            findings.append({
+                "rule_id": hip_rule["id"],
+                "name": hip_rule["name"],
+                "status": "CANNOT_ASSESS",
+                "citation": hip_rule["citation"],
+                "observed": "Hip-drive initiation was not measured",
+                "explanation": "The current video telemetry does not reliably distinguish hip-drive initiation from a coordinated ascent.",
+                "actionable_feedback": "Drive your hips straight up out of the bottom position."
+            })
+        else:
+            status = "MEETS_STANDARD" if hip_drive_ok else "DOES_NOT_MEET_STANDARD"
+            findings.append({
+                "rule_id": hip_rule["id"],
+                "name": hip_rule["name"],
+                "status": status,
+                "citation": hip_rule["citation"],
+                "observed": "Hips initiated vertical ascent" if hip_drive_ok else "Hips stalled or shifted horizontally on ascent",
+                "explanation": hip_rule["pass_message"] if hip_drive_ok else hip_rule["fail_message"],
+                "actionable_feedback": "Strong hip drive!" if hip_drive_ok else "Think of a chain pulling your hips straight up out of the bottom position."
+            })
 
         # 7. Unassessable Stance & Grip Rule
         sg_rule = self.rules["STANCE_AND_GRIP"]

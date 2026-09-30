@@ -62,7 +62,9 @@ class BiomechanicsCalculator:
         knee_angle = BiomechanicsCalculator.calculate_angle(hip, knee, ankle)
         hip_angle = BiomechanicsCalculator.calculate_angle(sh, hip, knee)
         back_angle = BiomechanicsCalculator.calculate_back_angle(sh, hip)
-        gaze_angle = BiomechanicsCalculator.calculate_gaze_angle(ear, eye, (0, 0))
+        # MediaPipe Pose does not provide iris direction. Eye-to-ear geometry
+        # describes head pose, so do not report it as measured eye gaze.
+        gaze_angle = None
 
         # 2. Midfoot & Bar path
         midfoot_x = (heel[0] + toe[0]) / 2.0
@@ -105,5 +107,6 @@ class BiomechanicsCalculator:
             "is_deep": is_deep,
             "knee_forward_px": knee_forward_px,
             "hip_y": hip_crease_y,
+            "shoulder_y": sh[1],
             "patella_y": patella_top_y
         }
