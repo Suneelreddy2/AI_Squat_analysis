@@ -48,7 +48,7 @@ if HAS_WEBRTC:
 
         def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
             bgr = frame.to_ndarray(format="bgr24")
-            out = self.counter.process_frame(bgr)
+            out = self.counter.process_frame(bgr, timestamp=frame.time)
             return av.VideoFrame.from_ndarray(out, format="bgr24")
 else:
     _SquatTransformer = None

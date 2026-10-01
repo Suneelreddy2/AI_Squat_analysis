@@ -39,6 +39,8 @@ class LiveRepCounter:
         self._record_path = None
         self._record_writer = None
         self._record_frame_count = 0
+        self._record_pending_frames = []
+        self._record_last_timestamp = None
 
         # MediaPipe Pose (lightweight, low-latency)
         self.pose = _mp_pose.Pose(
@@ -111,6 +113,8 @@ class LiveRepCounter:
             )
             self._record_writer = None
             self._record_frame_count = 0
+            self._record_pending_frames = []
+            self._record_last_timestamp = None
             self._recording = True
             return True
 
@@ -118,39 +122,67 @@ class LiveRepCounter:
         """Stop recording and return the raw video path when frames were saved."""
         with self._record_lock:
             self._recording = False
+            if self._record_writer is None and self._record_pending_frames:
+                self._open_record_writer(*self._record_pending_frames[0][0].shape[1::-1], fps=30.0)
+                self._flush_pending_record_frames()
             if self._record_writer is not None:
                 self._record_writer.release()
                 self._record_writer = None
             path = self._record_path if self._record_frame_count else None
             self._record_path = None
             self._record_frame_count = 0
+            self._record_pending_frames = []
+            self._record_last_timestamp = None
             return path
 
-    def _write_recording_frame(self, frame: np.ndarray):
+    def _open_record_writer(self, width: int, height: int, fps: float):
+        size = (width, height)
+        self._record_writer = cv2.VideoWriter(
+            self._record_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, size
+        )
+        if not self._record_writer.isOpened():
+            self._record_writer.release()
+            self._record_writer = None
+            self._recording = False
+            self._record_pending_frames.clear()
+            return False
+        return True
+
+    def _flush_pending_record_frames(self):
+        if self._record_writer is None:
+            return
+        for pending_frame, _ in self._record_pending_frames:
+            self._record_writer.write(pending_frame)
+            self._record_frame_count += 1
+        self._record_pending_frames.clear()
+
+    def _write_recording_frame(self, frame: np.ndarray, timestamp: float = None):
         with self._record_lock:
             if not self._recording:
                 return
-            height, width = frame.shape[:2]
+            if timestamp is None or not math.isfinite(timestamp):
+                timestamp = time.monotonic()
+            if self._record_last_timestamp is not None and timestamp <= self._record_last_timestamp:
+                timestamp = self._record_last_timestamp + (1.0 / 30.0)
+            self._record_last_timestamp = timestamp
+
             if self._record_writer is None:
-                size = (width, height)
-                self._record_writer = cv2.VideoWriter(
-                    self._record_path, cv2.VideoWriter_fourcc(*"avc1"), 30.0, size
-                )
-                if not self._record_writer.isOpened():
-                    self._record_writer.release()
-                    self._record_writer = cv2.VideoWriter(
-                        self._record_path, cv2.VideoWriter_fourcc(*"mp4v"), 30.0, size
-                    )
-                if not self._record_writer.isOpened():
-                    self._record_writer.release()
-                    self._record_writer = None
-                    self._recording = False
-                    return
+                self._record_pending_frames.append((frame.copy(), timestamp))
+                first_timestamp = self._record_pending_frames[0][1]
+                elapsed = timestamp - first_timestamp
+                if len(self._record_pending_frames) >= 12 and elapsed >= 0.5:
+                    measured_fps = (len(self._record_pending_frames) - 1) / elapsed
+                    measured_fps = min(60.0, max(5.0, measured_fps))
+                    height, width = frame.shape[:2]
+                    if self._open_record_writer(width, height, measured_fps):
+                        self._flush_pending_record_frames()
+                return
+
             self._record_writer.write(frame)
             self._record_frame_count += 1
 
     # ─── Frame processing (called from WebRTC worker thread) ─────────────────
-    def process_frame(self, bgr: np.ndarray) -> np.ndarray:
+    def process_frame(self, bgr: np.ndarray, timestamp: float = None) -> np.ndarray:
         h, w = bgr.shape[:2]
         rgb  = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         res  = self.pose.process(rgb)
@@ -159,7 +191,7 @@ class LiveRepCounter:
             with self.lock:
                 self._metrics["pose_conf"] = 0.0
             out = self._draw_hud(bgr, {})
-            self._write_recording_frame(bgr)
+            self._write_recording_frame(bgr, timestamp)
             return out
 
         lm_raw = res.pose_landmarks.landmark
@@ -218,7 +250,7 @@ class LiveRepCounter:
 
         # Overlay large rep counter
         out = self._draw_hud(out, tel, phase, conf)
-        self._write_recording_frame(bgr)
+        self._write_recording_frame(bgr, timestamp)
         return out
 
     # ─── State machine ────────────────────────────────────────────────────────
