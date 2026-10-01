@@ -75,14 +75,43 @@ def _render_live_camera():
     c_stream, c_setup = st.columns([2, 1], gap="large")
 
     with c_stream:
-        RTC_CONFIG = RTCConfiguration(
-            {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+        def configured_secret(name):
+            value = os.getenv(name)
+            try:
+                value = st.secrets.get(name, value)
+            except Exception:
+                pass
+            return str(value).strip() if value else ""
+
+        cloudflare_key_id = configured_secret("CLOUDFLARE_TURN_KEY_ID")
+        cloudflare_api_token = configured_secret("CLOUDFLARE_TURN_KEY_API_TOKEN")
+        turn_url = configured_secret("WEBRTC_TURN_URL")
+        turn_username = configured_secret("WEBRTC_TURN_USERNAME")
+        turn_credential = configured_secret("WEBRTC_TURN_CREDENTIAL")
+        has_turn = bool(cloudflare_key_id and cloudflare_api_token) or bool(
+            turn_url and turn_username and turn_credential
         )
+
+        if cloudflare_key_id and cloudflare_api_token:
+            # streamlit-webrtc reads these server-side and obtains short-lived
+            # Cloudflare TURN credentials when rtc_configuration is omitted.
+            os.environ["CLOUDFLARE_TURN_KEY_ID"] = cloudflare_key_id
+            os.environ["CLOUDFLARE_TURN_KEY_API_TOKEN"] = cloudflare_api_token
+            rtc_config = None
+        else:
+            ice_servers = [{"urls": ["stun:stun.l.google.com:19302"]}]
+            if turn_url and turn_username and turn_credential:
+                ice_servers.append({
+                    "urls": [turn_url],
+                    "username": turn_username,
+                    "credential": turn_credential,
+                })
+            rtc_config = RTCConfiguration({"iceServers": ice_servers})
 
         ctx = webrtc_streamer(
             key="squat-live",
             video_processor_factory=_SquatTransformer,
-            rtc_configuration=RTC_CONFIG,
+            rtc_configuration=rtc_config,
             media_stream_constraints={"video": True, "audio": False},
             async_processing=True,
         )
@@ -96,6 +125,11 @@ def _render_live_camera():
                 "3. Keep your head, hips, knees, and feet visible."
             )
             st.info("Use http://localhost:8501 on this computer. Camera access requires HTTPS when opening the app through a LAN or remote address.")
+            if not has_turn:
+                st.warning(
+                    "Remote camera connections may time out with STUN alone. "
+                    "Configure Cloudflare TURN credentials in Streamlit Secrets for hosted use."
+                )
 
     counter = getattr(ctx.video_processor, "counter", None) if ctx else None
     if counter is not None:

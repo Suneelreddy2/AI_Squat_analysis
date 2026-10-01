@@ -45,6 +45,17 @@ Open your browser at `http://localhost:8501`.
 
 For live camera access, open the app on the same computer using `localhost`. Browsers require a secure page for webcam access: remote or LAN access must use HTTPS. In the live counter, start the camera to begin recording, stop the camera to save the clip, then select **Analyze recording** to open the full report with the raw video, annotated video, rep audit, and telemetry.
 
+### Hosted webcam setup
+
+Remote WebRTC connections may fail with STUN alone when a network blocks direct peer-to-peer traffic. For Streamlit Community Cloud, configure Cloudflare Realtime TURN credentials in the app's **Manage app → Settings → Secrets** panel:
+
+```toml
+CLOUDFLARE_TURN_KEY_ID = "your-turn-key-id"
+CLOUDFLARE_TURN_KEY_API_TOKEN = "your-turn-api-token"
+```
+
+Create these credentials in Cloudflare Realtime. Keep them in Streamlit Secrets; do not commit them to the repository. The app passes them to `streamlit-webrtc`, which obtains short-lived ICE server credentials. Without TURN credentials, the app falls back to Google STUN, which may not work on restrictive networks.
+
 ## 📁 Project Structure
 
 ```
