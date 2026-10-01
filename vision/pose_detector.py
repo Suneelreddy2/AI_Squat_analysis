@@ -6,13 +6,19 @@ from typing import Dict, Any, Tuple, Optional
 class PoseDetector:
     def __init__(self, min_detection_confidence: float = 0.5, min_tracking_confidence: float = 0.5):
         self.mp_pose = mp.solutions.pose
-        self.pose = self.mp_pose.Pose(
-            static_image_mode=False,
-            model_complexity=2, # Higher accuracy
-            smooth_landmarks=True,
-            min_detection_confidence=min_detection_confidence,
-            min_tracking_confidence=min_tracking_confidence
-        )
+        pose_options = {
+            "static_image_mode": False,
+            "smooth_landmarks": True,
+            "min_detection_confidence": min_detection_confidence,
+            "min_tracking_confidence": min_tracking_confidence,
+        }
+        try:
+            # The heavy model offers higher accuracy, but some hosted Linux
+            # environments ship its .tflite file without read permission.
+            self.pose = self.mp_pose.Pose(model_complexity=2, **pose_options)
+        except PermissionError:
+            # Fall back to MediaPipe's full model so analysis can still run.
+            self.pose = self.mp_pose.Pose(model_complexity=1, **pose_options)
 
     def process_frame(self, frame: np.ndarray) -> Tuple[Optional[Dict[str, Tuple[float, float, float]]], float]:
         """
