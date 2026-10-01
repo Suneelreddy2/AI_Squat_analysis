@@ -566,7 +566,12 @@ if selected_video_path and app_mode in ("📂 Video Analysis Studio", "📷 Live
 }})();
 </script>
 """
-            components.html(dual_player_html, height=560, scrolling=False)
+            if hasattr(st, "iframe"):
+                st.iframe(dual_player_html, height=560)
+            else:
+                # Keep compatibility with the minimum Streamlit version in
+                # requirements.txt, which predates st.iframe.
+                components.html(dual_player_html, height=560, scrolling=False)
 
             # Rep quick-jump reference strip
             if reps:
